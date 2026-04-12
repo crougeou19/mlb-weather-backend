@@ -5,7 +5,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// MLB stadium coordinates for weather lookup
+// Cache configuration
+const CACHE_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+let cachedGames: any[] | null = null;
+let lastCacheTime: number = 0;
+
 const STADIUM_COORDS: Record<string, { lat: number; lon: number; name: string }> = {
   "Atlanta Braves":        { lat: 33.8907, lon: -84.4677, name: "Truist Park" },
   "Arizona Diamondbacks":  { lat: 33.4453, lon: -112.0667, name: "Chase Field" },
@@ -48,31 +52,43 @@ app.get("/", (req, res) => {
 
 app.get("/games", async (req, res) => {
   try {
-    // 1. Fetch today's MLB odds from TheOddsAPI
+    const now = Date.now();
+
+    // Return cached data if still fresh
+    if (cachedGames && (now - lastCacheTime) < CACHE_DURATION_MS) {
+      const ageSeconds = Math.round((now - lastCacheTime) / 1000);
+      res.setHeader("X-Cache", "HIT");
+      res.setHeader("X-Cache-Age", `${ageSeconds}s`);
+      return res.json(cachedGames);
+    }
+
+    // Fetch fresh data from TheOddsAPI
     const oddsRes = await fetch(
       `https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=totals&oddsFormat=american`
     );
 
     if (!oddsRes.ok) {
+      // If API call fails but we have stale cache, return it rather than erroring
+      if (cachedGames) {
+        res.setHeader("X-Cache", "STALE");
+        return res.json(cachedGames);
+      }
       throw new Error(`Odds API error: ${oddsRes.status}`);
     }
 
     const oddsData = await oddsRes.json() as any[];
 
-    // 2. For each game, fetch weather at the home team's stadium
     const games = await Promise.all(
       oddsData.map(async (game: any) => {
         const homeTeam = game.home_team;
         const awayTeam = game.away_team;
         const commenceTime = game.commence_time;
 
-        // Get totals line
         const bookmaker = game.bookmakers?.[0];
         const totalsMarket = bookmaker?.markets?.find((m: any) => m.key === "totals");
         const overLine = totalsMarket?.outcomes?.find((o: any) => o.name === "Over");
         const total = overLine?.point ?? null;
 
-        // Get weather for home stadium
         let weather = null;
         const stadium = STADIUM_COORDS[homeTeam];
         if (stadium && WEATHER_API_KEY) {
@@ -93,7 +109,7 @@ app.get("/games", async (req, res) => {
               };
             }
           } catch (e) {
-            // Weather fetch failed for this game, continue without it
+            // Weather fetch failed, continue without it
           }
         }
 
@@ -108,7 +124,13 @@ app.get("/games", async (req, res) => {
       })
     );
 
+    // Store in cache
+    cachedGames = games;
+    lastCacheTime = now;
+
+    res.setHeader("X-Cache", "MISS");
     res.json(games);
+
   } catch (err: any) {
     console.error("Error fetching games:", err.message);
     res.status(500).json({ error: "Failed to fetch games data", details: err.message });
