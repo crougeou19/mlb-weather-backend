@@ -1,9 +1,10 @@
-{
+{{
   "name": "mlb-weather-backend",
   "version": "1.0.0",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "postinstall": "tsc",
     "start": "node dist/index.js"
   },
   "dependencies": {
