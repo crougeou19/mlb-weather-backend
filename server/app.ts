@@ -5,10 +5,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Cache configuration
-const CACHE_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+const CACHE_DURATION_MS = 10 * 60 * 1000;
 let cachedGames: any[] | null = null;
 let lastCacheTime: number = 0;
+
+// Domed/retractable stadiums where wind is irrelevant
+const DOMED_STADIUMS = new Set([
+  "Tampa Bay Rays",
+  "Toronto Blue Jays",
+  "Houston Astros",
+  "Milwaukee Brewers",
+  "Seattle Mariners",
+  "Arizona Diamondbacks",
+  "Texas Rangers",
+  "Miami Marlins",
+]);
 
 const STADIUM_COORDS: Record<string, { lat: number; lon: number; name: string }> = {
   "Atlanta Braves":        { lat: 33.8907, lon: -84.4677, name: "Truist Park" },
@@ -43,6 +54,78 @@ const STADIUM_COORDS: Record<string, { lat: number; lon: number; name: string }>
   "Washington Nationals":  { lat: 38.8730, lon: -77.0074, name: "Nationals Park" },
 };
 
+// Stadium outfield orientations (degrees the outfield faces)
+const STADIUM_ORIENTATIONS: Record<string, number> = {
+  "Atlanta Braves": 30, "Arizona Diamondbacks": 0, "Baltimore Orioles": 75,
+  "Boston Red Sox": 85, "Chicago Cubs": 95, "Chicago White Sox": 135,
+  "Cincinnati Reds": 20, "Cleveland Guardians": 15, "Colorado Rockies": 20,
+  "Detroit Tigers": 25, "Houston Astros": 0, "Kansas City Royals": 10,
+  "Los Angeles Angels": 220, "Los Angeles Dodgers": 30, "Miami Marlins": 0,
+  "Milwaukee Brewers": 0, "Minnesota Twins": 100, "New York Mets": 180,
+  "New York Yankees": 195, "Oakland Athletics": 45, "Philadelphia Phillies": 65,
+  "Pittsburgh Pirates": 10, "San Diego Padres": 20, "San Francisco Giants": 55,
+  "Seattle Mariners": 0, "St. Louis Cardinals": 100, "Tampa Bay Rays": 0,
+  "Texas Rangers": 0, "Toronto Blue Jays": 0, "Washington Nationals": 195,
+};
+
+function getWindType(windDeg: number, stadiumOrientation: number): "OUT" | "IN" | "CROSS" {
+  const relative = ((windDeg - stadiumOrientation) + 360) % 360;
+  if (relative >= 315 || relative <= 45) return "OUT";
+  if (relative >= 135 && relative <= 225) return "IN";
+  return "CROSS";
+}
+
+function calculateEdge({ windSpeed, windType, temp, humidity, total, isDomed }: {
+  windSpeed: number;
+  windType: "OUT" | "IN" | "CROSS";
+  temp: number;
+  humidity: number;
+  total: number;
+  isDomed: boolean;
+}) {
+  let score = 0;
+
+  // Wind (skip for domed stadiums)
+  if (!isDomed) {
+    if (windType === "OUT") score += windSpeed * 1.5;
+    if (windType === "IN") score -= windSpeed * 1.5;
+    if (windSpeed >= 12) score *= 1.2;
+    if (windSpeed >= 15) score *= 1.4;
+  }
+
+  // Temp
+  if (temp >= 85) score += 8;
+  else if (temp >= 75) score += 5;
+  else if (temp <= 50) score -= 8;
+  else if (temp <= 60) score -= 5;
+
+  // Humidity
+  if (humidity < 40) score += 3;
+  if (humidity > 70) score -= 3;
+
+  // Combo bonus
+  if (temp >= 85 && humidity < 50) score += 5;
+
+  const runsAdded = score / 20;
+  const adjustedTotal = total + runsAdded;
+
+  let play = "NO EDGE";
+  let confidence = "LOW";
+  if (score >= 20) { play = "OVER"; confidence = "HIGH"; }
+  else if (score >= 10) { play = "OVER"; confidence = "MEDIUM"; }
+  else if (score <= -20) { play = "UNDER"; confidence = "HIGH"; }
+  else if (score <= -10) { play = "UNDER"; confidence = "MEDIUM"; }
+
+  return {
+    score: Math.round(score),
+    play,
+    confidence,
+    runsAdded: Number(runsAdded.toFixed(1)),
+    adjustedTotal: Number(adjustedTotal.toFixed(1)),
+    isDomed,
+  };
+}
+
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 const WEATHER_API_KEY = process.env.WEATHER_API_KEY;
 
@@ -50,91 +133,111 @@ app.get("/", (req, res) => {
   res.send("API is running 🚀");
 });
 
+async function fetchGames() {
+  const oddsRes = await fetch(
+    `https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=totals,h2h&oddsFormat=american`
+  );
+  if (!oddsRes.ok) throw new Error(`Odds API error: ${oddsRes.status}`);
+  const oddsData = await oddsRes.json() as any[];
+
+  return Promise.all(
+    oddsData.map(async (game: any) => {
+      const homeTeam = game.home_team;
+      const awayTeam = game.away_team;
+      const commenceTime = game.commence_time;
+      const isDomed = DOMED_STADIUMS.has(homeTeam);
+
+      const bookmaker = game.bookmakers?.[0];
+      const totalsMarket = bookmaker?.markets?.find((m: any) => m.key === "totals");
+      const h2hMarket = bookmaker?.markets?.find((m: any) => m.key === "h2h");
+      const overLine = totalsMarket?.outcomes?.find((o: any) => o.name === "Over");
+      const total = overLine?.point ?? null;
+      const homeML = h2hMarket?.outcomes?.find((o: any) => o.name === homeTeam)?.price ?? null;
+      const awayML = h2hMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.price ?? null;
+
+      let weather = null;
+      let edge = null;
+      const stadium = STADIUM_COORDS[homeTeam];
+      const orientation = STADIUM_ORIENTATIONS[homeTeam] ?? 0;
+
+      if (stadium && WEATHER_API_KEY) {
+        try {
+          const weatherRes = await fetch(
+            `https://api.openweathermap.org/data/2.5/weather?lat=${stadium.lat}&lon=${stadium.lon}&appid=${WEATHER_API_KEY}&units=imperial`
+          );
+          if (weatherRes.ok) {
+            const wd = await weatherRes.json() as any;
+            const windDeg = wd.wind?.deg ?? 0;
+            const windSpeed = Math.round(wd.wind?.speed ?? 0);
+            const windType = getWindType(windDeg, orientation);
+
+            weather = {
+              stadium: stadium.name,
+              temp_f: Math.round(wd.main.temp),
+              feels_like_f: Math.round(wd.main.feels_like),
+              humidity: wd.main.humidity,
+              wind_mph: windSpeed,
+              wind_deg: windDeg,
+              wind_type: windType,
+              condition: wd.weather?.[0]?.description ?? "unknown",
+              isDomed,
+            };
+
+            if (total !== null) {
+              edge = calculateEdge({
+                windSpeed,
+                windType,
+                temp: Math.round(wd.main.temp),
+                humidity: wd.main.humidity,
+                total,
+                isDomed,
+              });
+            }
+          }
+        } catch (e) {}
+      }
+
+      return { id: game.id, home_team: homeTeam, away_team: awayTeam, commence_time: commenceTime, total, home_ml: homeML, away_ml: awayML, weather, edge };
+    })
+  );
+}
+
 app.get("/games", async (req, res) => {
   try {
     const now = Date.now();
-
-    // Return cached data if still fresh
     if (cachedGames && (now - lastCacheTime) < CACHE_DURATION_MS) {
-      const ageSeconds = Math.round((now - lastCacheTime) / 1000);
       res.setHeader("X-Cache", "HIT");
-      res.setHeader("X-Cache-Age", `${ageSeconds}s`);
       return res.json(cachedGames);
     }
-
-    // Fetch fresh data from TheOddsAPI
-    const oddsRes = await fetch(
-      `https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=totals&oddsFormat=american`
-    );
-
-    if (!oddsRes.ok) {
-      // If API call fails but we have stale cache, return it rather than erroring
-      if (cachedGames) {
-        res.setHeader("X-Cache", "STALE");
-        return res.json(cachedGames);
-      }
-      throw new Error(`Odds API error: ${oddsRes.status}`);
+    if (!cachedGames) {
+      // First request — fetch and return
+    } else {
+      res.setHeader("X-Cache", "STALE");
     }
-
-    const oddsData = await oddsRes.json() as any[];
-
-    const games = await Promise.all(
-      oddsData.map(async (game: any) => {
-        const homeTeam = game.home_team;
-        const awayTeam = game.away_team;
-        const commenceTime = game.commence_time;
-
-        const bookmaker = game.bookmakers?.[0];
-        const totalsMarket = bookmaker?.markets?.find((m: any) => m.key === "totals");
-        const overLine = totalsMarket?.outcomes?.find((o: any) => o.name === "Over");
-        const total = overLine?.point ?? null;
-
-        let weather = null;
-        const stadium = STADIUM_COORDS[homeTeam];
-        if (stadium && WEATHER_API_KEY) {
-          try {
-            const weatherRes = await fetch(
-              `https://api.openweathermap.org/data/2.5/weather?lat=${stadium.lat}&lon=${stadium.lon}&appid=${WEATHER_API_KEY}&units=imperial`
-            );
-            if (weatherRes.ok) {
-              const weatherData = await weatherRes.json() as any;
-              weather = {
-                stadium: stadium.name,
-                temp_f: Math.round(weatherData.main.temp),
-                feels_like_f: Math.round(weatherData.main.feels_like),
-                humidity: weatherData.main.humidity,
-                wind_mph: Math.round(weatherData.wind.speed),
-                wind_deg: weatherData.wind.deg,
-                condition: weatherData.weather?.[0]?.description ?? "unknown",
-              };
-            }
-          } catch (e) {
-            // Weather fetch failed, continue without it
-          }
-        }
-
-        return {
-          id: game.id,
-          home_team: homeTeam,
-          away_team: awayTeam,
-          commence_time: commenceTime,
-          total,
-          weather,
-        };
-      })
-    );
-
-    // Store in cache
+    const games = await fetchGames();
     cachedGames = games;
     lastCacheTime = now;
-
     res.setHeader("X-Cache", "MISS");
     res.json(games);
-
   } catch (err: any) {
-    console.error("Error fetching games:", err.message);
+    if (cachedGames) return res.json(cachedGames);
     res.status(500).json({ error: "Failed to fetch games data", details: err.message });
   }
 });
+
+async function refreshCache() {
+  try {
+    console.log("Background cache refresh starting...");
+    const games = await fetchGames();
+    cachedGames = games;
+    lastCacheTime = Date.now();
+    console.log(`Cache refreshed with ${games.length} games`);
+  } catch (err: any) {
+    console.error("Background refresh failed:", err.message);
+  }
+}
+
+refreshCache();
+setInterval(refreshCache, 9 * 60 * 1000);
 
 export default app;
