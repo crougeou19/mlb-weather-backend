@@ -246,6 +246,6 @@ async function refreshCache() {
 }
 
 refreshCache();
-setInterval(refreshCache, 9 * 60 * 1000);
+setInterval(refreshCache, 4 * 60 * 60 * 1000);
 
 export default app;
