@@ -9,7 +9,6 @@ const CACHE_DURATION_MS = 10 * 60 * 1000;
 let cachedGames: any[] | null = null;
 let lastCacheTime: number = 0;
 
-// Domed/retractable stadiums where wind is irrelevant
 const DOMED_STADIUMS = new Set([
   "Tampa Bay Rays",
   "Toronto Blue Jays",
@@ -54,7 +53,6 @@ const STADIUM_COORDS: Record<string, { lat: number; lon: number; name: string }>
   "Washington Nationals":  { lat: 38.8730, lon: -77.0074, name: "Nationals Park" },
 };
 
-// Stadium outfield orientations (degrees the outfield faces)
 const STADIUM_ORIENTATIONS: Record<string, number> = {
   "Atlanta Braves": 30, "Arizona Diamondbacks": 0, "Baltimore Orioles": 75,
   "Boston Red Sox": 85, "Chicago Cubs": 95, "Chicago White Sox": 135,
@@ -85,7 +83,6 @@ function calculateEdge({ windSpeed, windType, temp, humidity, total, isDomed }: 
 }) {
   let score = 0;
 
-  // Wind (skip for domed stadiums)
   if (!isDomed) {
     if (windType === "OUT") score += windSpeed * 1.5;
     if (windType === "IN") score -= windSpeed * 1.5;
@@ -93,17 +90,14 @@ function calculateEdge({ windSpeed, windType, temp, humidity, total, isDomed }: 
     if (windSpeed >= 15) score *= 1.4;
   }
 
-  // Temp
   if (temp >= 85) score += 8;
   else if (temp >= 75) score += 5;
   else if (temp <= 50) score -= 8;
   else if (temp <= 60) score -= 5;
 
-  // Humidity
   if (humidity < 40) score += 3;
   if (humidity > 70) score -= 3;
 
-  // Combo bonus
   if (temp >= 85 && humidity < 50) score += 5;
 
   const runsAdded = score / 20;
@@ -140,8 +134,17 @@ async function fetchGames() {
   if (!oddsRes.ok) throw new Error(`Odds API error: ${oddsRes.status}`);
   const oddsData = await oddsRes.json() as any[];
 
+  // Filter to today and future games only
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+
+  const todayGames = oddsData.filter((game: any) => {
+    const gameTime = new Date(game.commence_time);
+    return gameTime >= startOfToday;
+  });
+
   return Promise.all(
-    oddsData.map(async (game: any) => {
+    todayGames.map(async (game: any) => {
       const homeTeam = game.home_team;
       const awayTeam = game.away_team;
       const commenceTime = game.commence_time;
@@ -197,7 +200,17 @@ async function fetchGames() {
         } catch (e) {}
       }
 
-      return { id: game.id, home_team: homeTeam, away_team: awayTeam, commence_time: commenceTime, total, home_ml: homeML, away_ml: awayML, weather, edge };
+      return {
+        id: game.id,
+        home_team: homeTeam,
+        away_team: awayTeam,
+        commence_time: commenceTime,
+        total,
+        home_ml: homeML,
+        away_ml: awayML,
+        weather,
+        edge,
+      };
     })
   );
 }
@@ -208,11 +221,6 @@ app.get("/games", async (req, res) => {
     if (cachedGames && (now - lastCacheTime) < CACHE_DURATION_MS) {
       res.setHeader("X-Cache", "HIT");
       return res.json(cachedGames);
-    }
-    if (!cachedGames) {
-      // First request — fetch and return
-    } else {
-      res.setHeader("X-Cache", "STALE");
     }
     const games = await fetchGames();
     cachedGames = games;
