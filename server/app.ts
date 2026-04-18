@@ -5,7 +5,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const CACHE_DURATION_MS = 10 * 60 * 1000;
+const CACHE_DURATION_MS = 30 * 60 * 1000;
 let cachedGames: any[] | null = null;
 let lastCacheTime: number = 0;
 
@@ -150,7 +150,11 @@ async function fetchGames() {
       const commenceTime = game.commence_time;
       const isDomed = DOMED_STADIUMS.has(homeTeam);
 
-      const bookmaker = game.bookmakers?.[0];
+      // Prefer DraftKings, fall back to FanDuel, then any available bookmaker
+      const bookmaker = game.bookmakers?.find((b: any) => b.key === 'draftkings')
+        ?? game.bookmakers?.find((b: any) => b.key === 'fanduel')
+        ?? game.bookmakers?.[0];
+
       const totalsMarket = bookmaker?.markets?.find((m: any) => m.key === "totals");
       const h2hMarket = bookmaker?.markets?.find((m: any) => m.key === "h2h");
       const overLine = totalsMarket?.outcomes?.find((o: any) => o.name === "Over");
@@ -205,6 +209,7 @@ async function fetchGames() {
         home_team: homeTeam,
         away_team: awayTeam,
         commence_time: commenceTime,
+        bookmaker: bookmaker?.title ?? "Unknown",
         total,
         home_ml: homeML,
         away_ml: awayML,
