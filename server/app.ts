@@ -9,15 +9,88 @@ const CACHE_DURATION_MS = 30 * 60 * 1000;
 let cachedGames: any[] | null = null;
 let lastCacheTime: number = 0;
 
+// ─── RECORD TRACKER ───────────────────────────────────────────
+interface PredictionRecord {
+  gameId: string;
+  date: string;
+  homeTeam: string;
+  awayTeam: string;
+  predictedPlay: string; // OVER, UNDER, NO EDGE
+  total: number;
+  confidence: string;
+  settled: boolean;
+  actualRuns?: number;
+  result?: "WIN" | "LOSS" | "PUSH";
+}
+
+const predictionStore: Map<string, PredictionRecord> = new Map();
+
+// Season totals
+let seasonWins = 0;
+let seasonLosses = 0;
+let seasonPushes = 0;
+
+async function settlePredictions() {
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const dateStr = yesterday.toISOString().split("T")[0];
+
+  try {
+    const res = await fetch(
+      `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${dateStr}&hydrate=linescore`
+    );
+    const data = await res.json() as any;
+    const games = data?.dates?.[0]?.games || [];
+
+    for (const game of games) {
+      const gameId = String(game.gamePk);
+      const record = predictionStore.get(gameId);
+      if (!record || record.settled) continue;
+
+      const status = game.status?.abstractGameState;
+      if (status !== "Final") continue;
+
+      const homeRuns = game.teams?.home?.score ?? 0;
+      const awayRuns = game.teams?.away?.score ?? 0;
+      const totalRuns = homeRuns + awayRuns;
+
+      let result: "WIN" | "LOSS" | "PUSH" = "PUSH";
+      if (record.predictedPlay === "OVER") {
+        if (totalRuns > record.total) result = "WIN";
+        else if (totalRuns < record.total) result = "LOSS";
+        else result = "PUSH";
+      } else if (record.predictedPlay === "UNDER") {
+        if (totalRuns < record.total) result = "WIN";
+        else if (totalRuns > record.total) result = "LOSS";
+        else result = "PUSH";
+      } else {
+        // NO EDGE — skip from record
+        record.settled = true;
+        predictionStore.set(gameId, record);
+        continue;
+      }
+
+      record.settled = true;
+      record.actualRuns = totalRuns;
+      record.result = result;
+      predictionStore.set(gameId, record);
+
+      if (result === "WIN") seasonWins++;
+      else if (result === "LOSS") seasonLosses++;
+      else seasonPushes++;
+
+      console.log(`Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalRuns} — ${result}`);
+    }
+  } catch (err: any) {
+    console.error("Error settling predictions:", err.message);
+  }
+}
+
+// ─── STADIUM DATA ─────────────────────────────────────────────
 const DOMED_STADIUMS = new Set([
-  "Tampa Bay Rays",
-  "Toronto Blue Jays",
-  "Houston Astros",
-  "Milwaukee Brewers",
-  "Seattle Mariners",
-  "Arizona Diamondbacks",
-  "Texas Rangers",
-  "Miami Marlins",
+  "Tampa Bay Rays", "Toronto Blue Jays", "Houston Astros",
+  "Milwaukee Brewers", "Seattle Mariners", "Arizona Diamondbacks",
+  "Texas Rangers", "Miami Marlins",
 ]);
 
 const STADIUM_COORDS: Record<string, { lat: number; lon: number; name: string }> = {
@@ -97,7 +170,6 @@ function calculateEdge({ windSpeed, windType, temp, humidity, total, isDomed }: 
 
   if (humidity < 40) score += 3;
   if (humidity > 70) score -= 3;
-
   if (temp >= 85 && humidity < 50) score += 5;
 
   const runsAdded = score / 20;
@@ -127,6 +199,46 @@ app.get("/", (req, res) => {
   res.send("API is running 🚀");
 });
 
+// ─── RESULTS ENDPOINT ─────────────────────────────────────────
+app.get("/results", (req, res) => {
+  const today = new Date().toISOString().split("T")[0];
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const yesterdayStr = yesterday.toISOString().split("T")[0];
+
+  // Yesterday's settled predictions
+  const yesterdayResults = Array.from(predictionStore.values()).filter(
+    p => p.date === yesterdayStr && p.settled && p.result
+  );
+
+  const yesterdayWins = yesterdayResults.filter(p => p.result === "WIN").length;
+  const yesterdayLosses = yesterdayResults.filter(p => p.result === "LOSS").length;
+  const yesterdayPushes = yesterdayResults.filter(p => p.result === "PUSH").length;
+
+  const seasonTotal = seasonWins + seasonLosses;
+  const yesterdayTotal = yesterdayWins + yesterdayLosses;
+
+  res.json({
+    yesterday: {
+      date: yesterdayStr,
+      wins: yesterdayWins,
+      losses: yesterdayLosses,
+      pushes: yesterdayPushes,
+      total: yesterdayTotal,
+      pct: yesterdayTotal > 0 ? Math.round((yesterdayWins / yesterdayTotal) * 100) : null,
+      games: yesterdayResults,
+    },
+    season: {
+      wins: seasonWins,
+      losses: seasonLosses,
+      pushes: seasonPushes,
+      total: seasonTotal,
+      pct: seasonTotal > 0 ? Math.round((seasonWins / seasonTotal) * 100) : null,
+    },
+  });
+});
+
+// ─── FETCH GAMES ──────────────────────────────────────────────
 async function fetchGames() {
   const oddsRes = await fetch(
     `https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=totals,h2h&oddsFormat=american`
@@ -134,7 +246,6 @@ async function fetchGames() {
   if (!oddsRes.ok) throw new Error(`Odds API error: ${oddsRes.status}`);
   const oddsData = await oddsRes.json() as any[];
 
-  // Filter to today and future games only
   const startOfToday = new Date();
   startOfToday.setHours(0, 0, 0, 0);
 
@@ -143,6 +254,8 @@ async function fetchGames() {
     return gameTime >= startOfToday;
   });
 
+  const today = new Date().toISOString().split("T")[0];
+
   return Promise.all(
     todayGames.map(async (game: any) => {
       const homeTeam = game.home_team;
@@ -150,7 +263,6 @@ async function fetchGames() {
       const commenceTime = game.commence_time;
       const isDomed = DOMED_STADIUMS.has(homeTeam);
 
-      // Prefer DraftKings, fall back to FanDuel, then any available bookmaker
       const bookmaker = game.bookmakers?.find((b: any) => b.key === 'draftkings')
         ?? game.bookmakers?.find((b: any) => b.key === 'fanduel')
         ?? game.bookmakers?.[0];
@@ -199,6 +311,21 @@ async function fetchGames() {
                 total,
                 isDomed,
               });
+
+              // Store prediction for result tracking
+              const gameId = game.id;
+              if (!predictionStore.has(gameId) && edge.play !== "NO EDGE") {
+                predictionStore.set(gameId, {
+                  gameId,
+                  date: today,
+                  homeTeam,
+                  awayTeam,
+                  predictedPlay: edge.play,
+                  total,
+                  confidence: edge.confidence,
+                  settled: false,
+                });
+              }
             }
           }
         } catch (e) {}
@@ -250,7 +377,22 @@ async function refreshCache() {
   }
 }
 
+// Settle yesterday's predictions at 6am every day
+function scheduleSettlement() {
+  const now = new Date();
+  const next6am = new Date();
+  next6am.setHours(6, 0, 0, 0);
+  if (now >= next6am) next6am.setDate(next6am.getDate() + 1);
+  const msUntil6am = next6am.getTime() - now.getTime();
+  setTimeout(() => {
+    settlePredictions();
+    setInterval(settlePredictions, 24 * 60 * 60 * 1000);
+  }, msUntil6am);
+  console.log(`Settlement scheduled in ${Math.round(msUntil6am / 60000)} minutes`);
+}
+
 refreshCache();
 setInterval(refreshCache, 30 * 60 * 1000);
+scheduleSettlement();
 
 export default app;
