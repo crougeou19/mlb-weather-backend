@@ -61,6 +61,7 @@ async function settlePredictions() {
       if (result === "WIN") seasonWins++;
       else if (result === "LOSS") seasonLosses++;
       else seasonPushes++;
+      console.log(`Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalRuns} — ${result}`);
     }
   } catch (err: any) {
     console.error("Error settling predictions:", err.message);
@@ -79,7 +80,7 @@ interface PitcherStats {
 }
 
 const pitcherCache: Map<string, { data: PitcherStats; time: number }> = new Map();
-const PITCHER_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+const PITCHER_CACHE_TTL = 60 * 60 * 1000;
 
 async function fetchPitcherStats(playerId: number, playerName: string): Promise<PitcherStats | null> {
   const cacheKey = String(playerId);
@@ -87,7 +88,6 @@ async function fetchPitcherStats(playerId: number, playerName: string): Promise<
   if (cached && Date.now() - cached.time < PITCHER_CACHE_TTL) return cached.data;
 
   try {
-    // Fetch current season stats
     const res = await fetch(
       `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=season&group=pitching&season=${new Date().getFullYear()}`
     );
@@ -102,31 +102,7 @@ async function fetchPitcherStats(playerId: number, playerName: string): Promise<
     const bb = parseFloat(stats.baseOnBalls ?? "0");
     const hr = parseFloat(stats.homeRuns ?? "0");
     const k = parseFloat(stats.strikeOuts ?? "0");
-
-    // Calculate FIP: (13*HR + 3*BB - 2*K) / IP + ~3.10 constant
     const fip = ip > 0 ? ((13 * hr + 3 * bb - 2 * k) / ip) + 3.10 : era;
-
-    // Fetch Statcast fly ball rate from Baseball Savant
-    let flyBallRate = 35; // league average default
-    try {
-      const savantRes = await fetch(
-        `https://baseballsavant.mlb.com/statcast_search/csv?player_type=pitcher&pitchers_lookup[]=${playerId}&season=${new Date().getFullYear()}&type=details`
-      );
-      if (savantRes.ok) {
-        const csv = await savantRes.text();
-        const lines = csv.split('\n').filter(l => l.trim());
-        let flyBalls = 0, totalBIP = 0;
-        for (const line of lines.slice(1)) {
-          const cols = line.split(',');
-          const bbType = cols[33]?.trim().replace(/"/g, '');
-          if (bbType === 'fly_ball') flyBalls++;
-          if (['fly_ball','ground_ball','line_drive','popup'].includes(bbType)) totalBIP++;
-        }
-        if (totalBIP > 20) flyBallRate = Math.round((flyBalls / totalBIP) * 100);
-      }
-    } catch (e) {
-      // Use default if Savant fails
-    }
 
     const pitcherStats: PitcherStats = {
       name: playerName,
@@ -134,7 +110,7 @@ async function fetchPitcherStats(playerId: number, playerName: string): Promise<
       fip: Number(fip.toFixed(2)),
       kPer9: Number(kPer9.toFixed(1)),
       hrPer9: Number(hrPer9.toFixed(2)),
-      flyBallRate,
+      flyBallRate: 35, // league average default
       inningsPitched: ip,
     };
 
@@ -168,13 +144,11 @@ async function fetchProbablePitchers(date: string): Promise<Map<string, { home: 
   return map;
 }
 
-// ─── PITCHER SCORE ────────────────────────────────────────────
-function calculatePitcherScore(pitcher: PitcherStats | null, isHome: boolean): number {
-  if (!pitcher || pitcher.inningsPitched < 5) return 0; // Not enough data
+function calculatePitcherScore(pitcher: PitcherStats | null): number {
+  if (!pitcher || pitcher.inningsPitched < 5) return 0;
 
   let score = 0;
 
-  // ERA impact (league avg ~4.20)
   if (pitcher.era < 2.50) score -= 12;
   else if (pitcher.era < 3.25) score -= 8;
   else if (pitcher.era < 3.75) score -= 5;
@@ -183,7 +157,6 @@ function calculatePitcherScore(pitcher: PitcherStats | null, isHome: boolean): n
   else if (pitcher.era > 4.80) score += 5;
   else if (pitcher.era > 4.40) score += 3;
 
-  // FIP impact (more predictive than ERA)
   if (pitcher.fip < 2.75) score -= 10;
   else if (pitcher.fip < 3.25) score -= 6;
   else if (pitcher.fip < 3.75) score -= 3;
@@ -191,21 +164,18 @@ function calculatePitcherScore(pitcher: PitcherStats | null, isHome: boolean): n
   else if (pitcher.fip > 4.50) score += 4;
   else if (pitcher.fip > 4.10) score += 2;
 
-  // K/9 impact (high strikeouts = fewer balls in play = UNDER)
   if (pitcher.kPer9 > 11) score -= 6;
   else if (pitcher.kPer9 > 9.5) score -= 4;
   else if (pitcher.kPer9 > 8.5) score -= 2;
   else if (pitcher.kPer9 < 5.5) score += 4;
   else if (pitcher.kPer9 < 6.5) score += 2;
 
-  // HR/9 impact (high HR rate = OVER)
   if (pitcher.hrPer9 > 1.8) score += 6;
   else if (pitcher.hrPer9 > 1.4) score += 3;
   else if (pitcher.hrPer9 > 1.1) score += 1;
   else if (pitcher.hrPer9 < 0.5) score -= 4;
   else if (pitcher.hrPer9 < 0.7) score -= 2;
 
-  // Fly ball rate (high FB rate + wind out = amplified OVER)
   if (pitcher.flyBallRate > 45) score += 4;
   else if (pitcher.flyBallRate > 40) score += 2;
   else if (pitcher.flyBallRate < 25) score -= 3;
@@ -215,10 +185,21 @@ function calculatePitcherScore(pitcher: PitcherStats | null, isHome: boolean): n
 }
 
 // ─── STADIUM DATA ─────────────────────────────────────────────
-const DOMED_STADIUMS = new Set([
-  "Tampa Bay Rays", "Toronto Blue Jays", "Houston Astros",
-  "Milwaukee Brewers", "Seattle Mariners", "Arizona Diamondbacks",
-  "Texas Rangers", "Miami Marlins",
+
+// Only Tropicana Field is a true fixed dome — weather has zero effect
+const FIXED_DOME_STADIUMS = new Set([
+  "Tampa Bay Rays",
+]);
+
+// Retractable roof stadiums — weather still applies since roof is often open
+const RETRACTABLE_ROOF_STADIUMS = new Set([
+  "Houston Astros",
+  "Milwaukee Brewers",
+  "Seattle Mariners",
+  "Arizona Diamondbacks",
+  "Texas Rangers",
+  "Miami Marlins",
+  "Toronto Blue Jays",
 ]);
 
 const STADIUM_COORDS: Record<string, { lat: number; lon: number; name: string }> = {
@@ -274,36 +255,42 @@ function getWindType(windDeg: number, stadiumOrientation: number): "OUT" | "IN" 
   return "CROSS";
 }
 
-function calculateEdge({ windSpeed, windType, temp, humidity, total, isDomed, homePitcherScore, awayPitcherScore }: {
+function calculateEdge({ windSpeed, windType, temp, humidity, total, isFixedDome, isRetractable, homePitcherScore, awayPitcherScore }: {
   windSpeed: number;
   windType: "OUT" | "IN" | "CROSS";
   temp: number;
   humidity: number;
   total: number;
-  isDomed: boolean;
+  isFixedDome: boolean;
+  isRetractable: boolean;
   homePitcherScore: number;
   awayPitcherScore: number;
 }) {
   let score = 0;
 
-  // Weather
-  if (!isDomed) {
+  // Fixed dome (Tropicana) — skip ALL weather, pitching only
+  if (!isFixedDome) {
+    // Wind scoring — skip for retractable too if we wanted, but we apply it
     if (windType === "OUT") score += windSpeed * 1.5;
     if (windType === "IN") score -= windSpeed * 1.5;
     if (windSpeed >= 12) score *= 1.2;
     if (windSpeed >= 15) score *= 1.4;
+
+    // Temp scoring
+    if (temp >= 85) score += 8;
+    else if (temp >= 75) score += 5;
+    else if (temp <= 50) score -= 8;
+    else if (temp <= 60) score -= 5;
+
+    // Humidity scoring
+    if (humidity < 40) score += 3;
+    if (humidity > 70) score -= 3;
+
+    // Combo bonus
+    if (temp >= 85 && humidity < 50) score += 5;
   }
 
-  if (temp >= 85) score += 8;
-  else if (temp >= 75) score += 5;
-  else if (temp <= 50) score -= 8;
-  else if (temp <= 60) score -= 5;
-
-  if (humidity < 40) score += 3;
-  if (humidity > 70) score -= 3;
-  if (temp >= 85 && humidity < 50) score += 5;
-
-  // Pitcher scores (average of home and away)
+  // Pitcher scoring always applies regardless of stadium type
   const pitcherScore = (homePitcherScore + awayPitcherScore) / 2;
   score += pitcherScore;
 
@@ -323,7 +310,8 @@ function calculateEdge({ windSpeed, windType, temp, humidity, total, isDomed, ho
     confidence,
     runsAdded: Number(runsAdded.toFixed(1)),
     adjustedTotal: Number(adjustedTotal.toFixed(1)),
-    isDomed,
+    isFixedDome,
+    isRetractable,
     pitcherScore: Math.round(pitcherScore),
   };
 }
@@ -339,7 +327,6 @@ app.get("/results", (req, res) => {
   const yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
   const yesterdayStr = yesterday.toISOString().split("T")[0];
-
   const yesterdayResults = Array.from(predictionStore.values()).filter(
     p => p.date === yesterdayStr && p.settled && p.result
   );
@@ -369,11 +356,8 @@ app.get("/results", (req, res) => {
   });
 });
 
-// ─── FETCH GAMES ──────────────────────────────────────────────
 async function fetchGames() {
   const today = new Date().toISOString().split("T")[0];
-
-  // Fetch probable pitchers for today
   const probablePitchers = await fetchProbablePitchers(today);
 
   const oddsRes = await fetch(
@@ -395,7 +379,8 @@ async function fetchGames() {
       const homeTeam = game.home_team;
       const awayTeam = game.away_team;
       const commenceTime = game.commence_time;
-      const isDomed = DOMED_STADIUMS.has(homeTeam);
+      const isFixedDome = FIXED_DOME_STADIUMS.has(homeTeam);
+      const isRetractable = RETRACTABLE_ROOF_STADIUMS.has(homeTeam);
 
       const bookmaker = game.bookmakers?.find((b: any) => b.key === 'draftkings')
         ?? game.bookmakers?.find((b: any) => b.key === 'fanduel')
@@ -408,7 +393,6 @@ async function fetchGames() {
       const homeML = h2hMarket?.outcomes?.find((o: any) => o.name === homeTeam)?.price ?? null;
       const awayML = h2hMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.price ?? null;
 
-      // Fetch pitcher stats
       const pitchers = probablePitchers.get(homeTeam);
       let homePitcher: PitcherStats | null = null;
       let awayPitcher: PitcherStats | null = null;
@@ -417,11 +401,11 @@ async function fetchGames() {
 
       if (pitchers?.home?.id) {
         homePitcher = await fetchPitcherStats(pitchers.home.id, pitchers.home.fullName);
-        homePitcherScore = calculatePitcherScore(homePitcher, true);
+        homePitcherScore = calculatePitcherScore(homePitcher);
       }
       if (pitchers?.away?.id) {
         awayPitcher = await fetchPitcherStats(pitchers.away.id, pitchers.away.fullName);
-        awayPitcherScore = calculatePitcherScore(awayPitcher, false);
+        awayPitcherScore = calculatePitcherScore(awayPitcher);
       }
 
       let weather = null;
@@ -449,7 +433,8 @@ async function fetchGames() {
               wind_deg: windDeg,
               wind_type: windType,
               condition: wd.weather?.[0]?.description ?? "unknown",
-              isDomed,
+              isFixedDome,
+              isRetractable,
             };
 
             if (total !== null) {
@@ -459,7 +444,8 @@ async function fetchGames() {
                 temp: Math.round(wd.main.temp),
                 humidity: wd.main.humidity,
                 total,
-                isDomed,
+                isFixedDome,
+                isRetractable,
                 homePitcherScore,
                 awayPitcherScore,
               });
@@ -562,6 +548,8 @@ function scheduleSettlement() {
     }, 24 * 60 * 60 * 1000);
   }, msUntil6am);
 }
+
+refreshCache();
 setInterval(refreshCache, 30 * 60 * 1000);
 scheduleSettlement();
 
