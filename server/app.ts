@@ -549,16 +549,19 @@ async function refreshCache() {
 function scheduleSettlement() {
   const now = new Date();
   const next6am = new Date();
-  next6am.setHours(6, 0, 0, 0);
-  if (now >= next6am) next6am.setDate(next6am.getDate() + 1);
+  next6am.setUTCHours(6, 0, 0, 0);
+  if (now >= next6am) next6am.setUTCDate(next6am.getUTCDate() + 1);
   const msUntil6am = next6am.getTime() - now.getTime();
+  console.log(`Settlement scheduled in ${Math.round(msUntil6am / 60000)} minutes (next 6am UTC)`);
   setTimeout(() => {
+    console.log("Running daily settlement...");
     settlePredictions();
-    setInterval(settlePredictions, 24 * 60 * 60 * 1000);
+    setInterval(() => {
+      console.log("Running daily settlement...");
+      settlePredictions();
+    }, 24 * 60 * 60 * 1000);
   }, msUntil6am);
 }
-
-refreshCache();
 setInterval(refreshCache, 30 * 60 * 1000);
 scheduleSettlement();
 
