@@ -32,18 +32,41 @@ async function settlePredictions() {
   const yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
   const dateStr = yesterday.toISOString().split("T")[0];
+
+  console.log(`Settling predictions for ${dateStr}...`);
+  console.log(`Total stored predictions: ${predictionStore.size}`);
+
   try {
     const res = await fetch(
       `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${dateStr}&hydrate=linescore`
     );
     const data = await res.json() as any;
     const games = data?.dates?.[0]?.games || [];
+    console.log(`Found ${games.length} MLB games for ${dateStr}`);
+
     for (const game of games) {
-      const gameId = String(game.gamePk);
+      const homeTeamName = game.teams?.home?.team?.name;
+      // Match by home team + date key
+      const gameId = `${dateStr}_${homeTeamName?.replace(/\s+/g, '_')}`;
       const record = predictionStore.get(gameId);
-      if (!record || record.settled) continue;
-      if (game.status?.abstractGameState !== "Final") continue;
-      const totalRuns = (game.teams?.home?.score ?? 0) + (game.teams?.away?.score ?? 0);
+
+      if (!record) {
+        console.log(`No prediction found for ${gameId}`);
+        continue;
+      }
+      if (record.settled) {
+        console.log(`Already settled: ${gameId}`);
+        continue;
+      }
+      if (game.status?.abstractGameState !== "Final") {
+        console.log(`Game not final: ${gameId}`);
+        continue;
+      }
+
+      const homeRuns = game.teams?.home?.score ?? 0;
+      const awayRuns = game.teams?.away?.score ?? 0;
+      const totalRuns = homeRuns + awayRuns;
+
       let result: "WIN" | "LOSS" | "PUSH" = "PUSH";
       if (record.predictedPlay === "OVER") {
         result = totalRuns > record.total ? "WIN" : totalRuns < record.total ? "LOSS" : "PUSH";
@@ -54,15 +77,22 @@ async function settlePredictions() {
         predictionStore.set(gameId, record);
         continue;
       }
+
       record.settled = true;
       record.actualRuns = totalRuns;
       record.result = result;
       predictionStore.set(gameId, record);
+
       if (result === "WIN") seasonWins++;
       else if (result === "LOSS") seasonLosses++;
       else seasonPushes++;
-      console.log(`Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalRuns} — ${result}`);
+
+      console.log(`✅ Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalRuns} — ${result}`);
     }
+
+    const settled = Array.from(predictionStore.values()).filter(p => p.settled).length;
+    console.log(`Settlement complete. Total settled: ${settled}, Season: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
+
   } catch (err: any) {
     console.error("Error settling predictions:", err.message);
   }
@@ -110,7 +140,7 @@ async function fetchPitcherStats(playerId: number, playerName: string): Promise<
       fip: Number(fip.toFixed(2)),
       kPer9: Number(kPer9.toFixed(1)),
       hrPer9: Number(hrPer9.toFixed(2)),
-      flyBallRate: 35, // league average default
+      flyBallRate: 35,
       inningsPitched: ip,
     };
 
@@ -185,13 +215,10 @@ function calculatePitcherScore(pitcher: PitcherStats | null): number {
 }
 
 // ─── STADIUM DATA ─────────────────────────────────────────────
-
-// Only Tropicana Field is a true fixed dome — weather has zero effect
 const FIXED_DOME_STADIUMS = new Set([
   "Tampa Bay Rays",
 ]);
 
-// Retractable roof stadiums — weather still applies since roof is often open
 const RETRACTABLE_ROOF_STADIUMS = new Set([
   "Houston Astros",
   "Milwaukee Brewers",
@@ -268,29 +295,22 @@ function calculateEdge({ windSpeed, windType, temp, humidity, total, isFixedDome
 }) {
   let score = 0;
 
-  // Fixed dome (Tropicana) — skip ALL weather, pitching only
   if (!isFixedDome) {
-    // Wind scoring — skip for retractable too if we wanted, but we apply it
     if (windType === "OUT") score += windSpeed * 1.5;
     if (windType === "IN") score -= windSpeed * 1.5;
     if (windSpeed >= 12) score *= 1.2;
     if (windSpeed >= 15) score *= 1.4;
 
-    // Temp scoring
     if (temp >= 85) score += 8;
     else if (temp >= 75) score += 5;
     else if (temp <= 50) score -= 8;
     else if (temp <= 60) score -= 5;
 
-    // Humidity scoring
     if (humidity < 40) score += 3;
     if (humidity > 70) score -= 3;
-
-    // Combo bonus
     if (temp >= 85 && humidity < 50) score += 5;
   }
 
-  // Pitcher scoring always applies regardless of stadium type
   const pitcherScore = (homePitcherScore + awayPitcherScore) / 2;
   score += pitcherScore;
 
@@ -327,6 +347,7 @@ app.get("/results", (req, res) => {
   const yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
   const yesterdayStr = yesterday.toISOString().split("T")[0];
+
   const yesterdayResults = Array.from(predictionStore.values()).filter(
     p => p.date === yesterdayStr && p.settled && p.result
   );
@@ -450,7 +471,8 @@ async function fetchGames() {
                 awayPitcherScore,
               });
 
-              const gameId = game.id;
+              // Store prediction using home team + date key for reliable matching
+              const gameId = `${today}_${homeTeam.replace(/\s+/g, '_')}`;
               if (!predictionStore.has(gameId) && edge.play !== "NO EDGE") {
                 predictionStore.set(gameId, {
                   gameId,
@@ -462,6 +484,7 @@ async function fetchGames() {
                   confidence: edge.confidence,
                   settled: false,
                 });
+                console.log(`📝 Stored prediction: ${awayTeam} @ ${homeTeam} — ${edge.play} ${total}`);
               }
             }
           }
