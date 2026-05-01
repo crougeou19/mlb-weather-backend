@@ -46,7 +46,6 @@ async function settlePredictions() {
 
     for (const game of games) {
       const homeTeamName = game.teams?.home?.team?.name;
-      // Match by home team + date key
       const gameId = `${dateStr}_${homeTeamName?.replace(/\s+/g, '_')}`;
       const record = predictionStore.get(gameId);
 
@@ -355,6 +354,21 @@ app.get("/results", (req, res) => {
   const yesterdayLosses = yesterdayResults.filter(p => p.result === "LOSS").length;
   const yesterdayPushes = yesterdayResults.filter(p => p.result === "PUSH").length;
   const yesterdayTotal = yesterdayWins + yesterdayLosses;
+
+  // High confidence tracking
+  const allSettled = Array.from(predictionStore.values()).filter(p => p.settled && p.result);
+  const highConfSettled = allSettled.filter(p => p.confidence === "HIGH");
+  const highConfWins = highConfSettled.filter(p => p.result === "WIN").length;
+  const highConfLosses = highConfSettled.filter(p => p.result === "LOSS").length;
+  const highConfPushes = highConfSettled.filter(p => p.result === "PUSH").length;
+  const highConfTotal = highConfWins + highConfLosses;
+
+  // Yesterday high confidence
+  const yesterdayHigh = yesterdayResults.filter(p => p.confidence === "HIGH");
+  const yesterdayHighWins = yesterdayHigh.filter(p => p.result === "WIN").length;
+  const yesterdayHighLosses = yesterdayHigh.filter(p => p.result === "LOSS").length;
+  const yesterdayHighTotal = yesterdayHighWins + yesterdayHighLosses;
+
   const seasonTotal = seasonWins + seasonLosses;
 
   res.json({
@@ -366,6 +380,12 @@ app.get("/results", (req, res) => {
       total: yesterdayTotal,
       pct: yesterdayTotal > 0 ? Math.round((yesterdayWins / yesterdayTotal) * 100) : null,
       games: yesterdayResults,
+      high_confidence: {
+        wins: yesterdayHighWins,
+        losses: yesterdayHighLosses,
+        total: yesterdayHighTotal,
+        pct: yesterdayHighTotal > 0 ? Math.round((yesterdayHighWins / yesterdayHighTotal) * 100) : null,
+      },
     },
     season: {
       wins: seasonWins,
@@ -373,6 +393,13 @@ app.get("/results", (req, res) => {
       pushes: seasonPushes,
       total: seasonTotal,
       pct: seasonTotal > 0 ? Math.round((seasonWins / seasonTotal) * 100) : null,
+      high_confidence: {
+        wins: highConfWins,
+        losses: highConfLosses,
+        pushes: highConfPushes,
+        total: highConfTotal,
+        pct: highConfTotal > 0 ? Math.round((highConfWins / highConfTotal) * 100) : null,
+      },
     },
   });
 });
@@ -410,7 +437,15 @@ async function fetchGames() {
       const totalsMarket = bookmaker?.markets?.find((m: any) => m.key === "totals");
       const h2hMarket = bookmaker?.markets?.find((m: any) => m.key === "h2h");
       const overLine = totalsMarket?.outcomes?.find((o: any) => o.name === "Over");
-      const total = overLine?.point ?? null;
+
+      // ─── SANITY CHECK: Filter out unrealistic MLB totals ───
+      const rawTotal = overLine?.point ?? null;
+      const total = (rawTotal !== null && rawTotal >= 5.5 && rawTotal <= 13.5) ? rawTotal : null;
+
+      if (rawTotal !== null && (rawTotal < 5.5 || rawTotal > 13.5)) {
+        console.log(`⚠️ Filtered bad total for ${homeTeam}: ${rawTotal} — skipping edge calculation`);
+      }
+
       const homeML = h2hMarket?.outcomes?.find((o: any) => o.name === homeTeam)?.price ?? null;
       const awayML = h2hMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.price ?? null;
 
@@ -471,7 +506,7 @@ async function fetchGames() {
                 awayPitcherScore,
               });
 
-              // Store prediction using home team + date key for reliable matching
+              // Store prediction using home team + date key
               const gameId = `${today}_${homeTeam.replace(/\s+/g, '_')}`;
               if (!predictionStore.has(gameId) && edge.play !== "NO EDGE") {
                 predictionStore.set(gameId, {
