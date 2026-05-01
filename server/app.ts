@@ -9,6 +9,37 @@ const CACHE_DURATION_MS = 30 * 60 * 1000;
 let cachedGames: any[] | null = null;
 let lastCacheTime: number = 0;
 
+// ─── UPSTASH REDIS ────────────────────────────────────────────
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+async function redisGet(key: string): Promise<any> {
+  try {
+    const res = await fetch(`${REDIS_URL}/get/${key}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+    });
+    const data = await res.json() as any;
+    return data.result ? JSON.parse(data.result) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function redisSet(key: string, value: any): Promise<void> {
+  try {
+    await fetch(`${REDIS_URL}/set/${key}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ value: JSON.stringify(value) }),
+    });
+  } catch (e) {
+    console.error("Redis set error:", e);
+  }
+}
+
 // ─── RECORD TRACKER ───────────────────────────────────────────
 interface PredictionRecord {
   gameId: string;
@@ -23,10 +54,43 @@ interface PredictionRecord {
   result?: "WIN" | "LOSS" | "PUSH";
 }
 
-const predictionStore: Map<string, PredictionRecord> = new Map();
+let predictionStore: Map<string, PredictionRecord> = new Map();
 let seasonWins = 0;
 let seasonLosses = 0;
 let seasonPushes = 0;
+
+// Load persisted data from Redis on startup
+async function loadFromRedis() {
+  try {
+    console.log("Loading data from Redis...");
+    const predictions = await redisGet("predictions");
+    const season = await redisGet("season");
+
+    if (predictions) {
+      predictionStore = new Map(Object.entries(predictions));
+      console.log(`Loaded ${predictionStore.size} predictions from Redis`);
+    }
+    if (season) {
+      seasonWins = season.wins ?? 0;
+      seasonLosses = season.losses ?? 0;
+      seasonPushes = season.pushes ?? 0;
+      console.log(`Loaded season record: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
+    }
+  } catch (e) {
+    console.error("Failed to load from Redis:", e);
+  }
+}
+
+// Save predictions and season record to Redis
+async function saveToRedis() {
+  try {
+    const predictionsObj = Object.fromEntries(predictionStore);
+    await redisSet("predictions", predictionsObj);
+    await redisSet("season", { wins: seasonWins, losses: seasonLosses, pushes: seasonPushes });
+  } catch (e) {
+    console.error("Failed to save to Redis:", e);
+  }
+}
 
 async function settlePredictions() {
   const yesterday = new Date();
@@ -43,6 +107,8 @@ async function settlePredictions() {
     const data = await res.json() as any;
     const games = data?.dates?.[0]?.games || [];
     console.log(`Found ${games.length} MLB games for ${dateStr}`);
+
+    let anySettled = false;
 
     for (const game of games) {
       const homeTeamName = game.teams?.home?.team?.name;
@@ -81,6 +147,7 @@ async function settlePredictions() {
       record.actualRuns = totalRuns;
       record.result = result;
       predictionStore.set(gameId, record);
+      anySettled = true;
 
       if (result === "WIN") seasonWins++;
       else if (result === "LOSS") seasonLosses++;
@@ -91,6 +158,9 @@ async function settlePredictions() {
 
     const settled = Array.from(predictionStore.values()).filter(p => p.settled).length;
     console.log(`Settlement complete. Total settled: ${settled}, Season: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
+
+    // Save to Redis after settlement
+    if (anySettled) await saveToRedis();
 
   } catch (err: any) {
     console.error("Error settling predictions:", err.message);
@@ -355,260 +425,4 @@ app.get("/results", (req, res) => {
   const yesterdayPushes = yesterdayResults.filter(p => p.result === "PUSH").length;
   const yesterdayTotal = yesterdayWins + yesterdayLosses;
 
-  // High confidence tracking
-  const allSettled = Array.from(predictionStore.values()).filter(p => p.settled && p.result);
-  const highConfSettled = allSettled.filter(p => p.confidence === "HIGH");
-  const highConfWins = highConfSettled.filter(p => p.result === "WIN").length;
-  const highConfLosses = highConfSettled.filter(p => p.result === "LOSS").length;
-  const highConfPushes = highConfSettled.filter(p => p.result === "PUSH").length;
-  const highConfTotal = highConfWins + highConfLosses;
-
-  // Yesterday high confidence
-  const yesterdayHigh = yesterdayResults.filter(p => p.confidence === "HIGH");
-  const yesterdayHighWins = yesterdayHigh.filter(p => p.result === "WIN").length;
-  const yesterdayHighLosses = yesterdayHigh.filter(p => p.result === "LOSS").length;
-  const yesterdayHighTotal = yesterdayHighWins + yesterdayHighLosses;
-
-  const seasonTotal = seasonWins + seasonLosses;
-
-  res.json({
-    yesterday: {
-      date: yesterdayStr,
-      wins: yesterdayWins,
-      losses: yesterdayLosses,
-      pushes: yesterdayPushes,
-      total: yesterdayTotal,
-      pct: yesterdayTotal > 0 ? Math.round((yesterdayWins / yesterdayTotal) * 100) : null,
-      games: yesterdayResults,
-      high_confidence: {
-        wins: yesterdayHighWins,
-        losses: yesterdayHighLosses,
-        total: yesterdayHighTotal,
-        pct: yesterdayHighTotal > 0 ? Math.round((yesterdayHighWins / yesterdayHighTotal) * 100) : null,
-      },
-    },
-    season: {
-      wins: seasonWins,
-      losses: seasonLosses,
-      pushes: seasonPushes,
-      total: seasonTotal,
-      pct: seasonTotal > 0 ? Math.round((seasonWins / seasonTotal) * 100) : null,
-      high_confidence: {
-        wins: highConfWins,
-        losses: highConfLosses,
-        pushes: highConfPushes,
-        total: highConfTotal,
-        pct: highConfTotal > 0 ? Math.round((highConfWins / highConfTotal) * 100) : null,
-      },
-    },
-  });
-});
-
-async function fetchGames() {
-  const today = new Date().toISOString().split("T")[0];
-  const probablePitchers = await fetchProbablePitchers(today);
-
-  const oddsRes = await fetch(
-    `https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=totals,h2h&oddsFormat=american`
-  );
-  if (!oddsRes.ok) throw new Error(`Odds API error: ${oddsRes.status}`);
-  const oddsData = await oddsRes.json() as any[];
-
-  const startOfToday = new Date();
-  startOfToday.setHours(0, 0, 0, 0);
-
-  const todayGames = oddsData.filter((game: any) => {
-    const gameTime = new Date(game.commence_time);
-    return gameTime >= startOfToday;
-  });
-
-  return Promise.all(
-    todayGames.map(async (game: any) => {
-      const homeTeam = game.home_team;
-      const awayTeam = game.away_team;
-      const commenceTime = game.commence_time;
-      const isFixedDome = FIXED_DOME_STADIUMS.has(homeTeam);
-      const isRetractable = RETRACTABLE_ROOF_STADIUMS.has(homeTeam);
-
-      const bookmaker = game.bookmakers?.find((b: any) => b.key === 'draftkings')
-        ?? game.bookmakers?.find((b: any) => b.key === 'fanduel')
-        ?? game.bookmakers?.[0];
-
-      const totalsMarket = bookmaker?.markets?.find((m: any) => m.key === "totals");
-      const h2hMarket = bookmaker?.markets?.find((m: any) => m.key === "h2h");
-      const overLine = totalsMarket?.outcomes?.find((o: any) => o.name === "Over");
-
-      // ─── SANITY CHECK: Filter out unrealistic MLB totals ───
-      const rawTotal = overLine?.point ?? null;
-      const total = (rawTotal !== null && rawTotal >= 5.5 && rawTotal <= 13.5) ? rawTotal : null;
-
-      if (rawTotal !== null && (rawTotal < 5.5 || rawTotal > 13.5)) {
-        console.log(`⚠️ Filtered bad total for ${homeTeam}: ${rawTotal} — skipping edge calculation`);
-      }
-
-      const homeML = h2hMarket?.outcomes?.find((o: any) => o.name === homeTeam)?.price ?? null;
-      const awayML = h2hMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.price ?? null;
-
-      const pitchers = probablePitchers.get(homeTeam);
-      let homePitcher: PitcherStats | null = null;
-      let awayPitcher: PitcherStats | null = null;
-      let homePitcherScore = 0;
-      let awayPitcherScore = 0;
-
-      if (pitchers?.home?.id) {
-        homePitcher = await fetchPitcherStats(pitchers.home.id, pitchers.home.fullName);
-        homePitcherScore = calculatePitcherScore(homePitcher);
-      }
-      if (pitchers?.away?.id) {
-        awayPitcher = await fetchPitcherStats(pitchers.away.id, pitchers.away.fullName);
-        awayPitcherScore = calculatePitcherScore(awayPitcher);
-      }
-
-      let weather = null;
-      let edge = null;
-      const stadium = STADIUM_COORDS[homeTeam];
-      const orientation = STADIUM_ORIENTATIONS[homeTeam] ?? 0;
-
-      if (stadium && WEATHER_API_KEY) {
-        try {
-          const weatherRes = await fetch(
-            `https://api.openweathermap.org/data/2.5/weather?lat=${stadium.lat}&lon=${stadium.lon}&appid=${WEATHER_API_KEY}&units=imperial`
-          );
-          if (weatherRes.ok) {
-            const wd = await weatherRes.json() as any;
-            const windDeg = wd.wind?.deg ?? 0;
-            const windSpeed = Math.round(wd.wind?.speed ?? 0);
-            const windType = getWindType(windDeg, orientation);
-
-            weather = {
-              stadium: stadium.name,
-              temp_f: Math.round(wd.main.temp),
-              feels_like_f: Math.round(wd.main.feels_like),
-              humidity: wd.main.humidity,
-              wind_mph: windSpeed,
-              wind_deg: windDeg,
-              wind_type: windType,
-              condition: wd.weather?.[0]?.description ?? "unknown",
-              isFixedDome,
-              isRetractable,
-            };
-
-            if (total !== null) {
-              edge = calculateEdge({
-                windSpeed,
-                windType,
-                temp: Math.round(wd.main.temp),
-                humidity: wd.main.humidity,
-                total,
-                isFixedDome,
-                isRetractable,
-                homePitcherScore,
-                awayPitcherScore,
-              });
-
-              // Store prediction using home team + date key
-              const gameId = `${today}_${homeTeam.replace(/\s+/g, '_')}`;
-              if (!predictionStore.has(gameId) && edge.play !== "NO EDGE") {
-                predictionStore.set(gameId, {
-                  gameId,
-                  date: today,
-                  homeTeam,
-                  awayTeam,
-                  predictedPlay: edge.play,
-                  total,
-                  confidence: edge.confidence,
-                  settled: false,
-                });
-                console.log(`📝 Stored prediction: ${awayTeam} @ ${homeTeam} — ${edge.play} ${total}`);
-              }
-            }
-          }
-        } catch (e) {}
-      }
-
-      return {
-        id: game.id,
-        home_team: homeTeam,
-        away_team: awayTeam,
-        commence_time: commenceTime,
-        bookmaker: bookmaker?.title ?? "Unknown",
-        total,
-        home_ml: homeML,
-        away_ml: awayML,
-        weather,
-        edge,
-        pitchers: {
-          home: homePitcher ? {
-            name: homePitcher.name,
-            era: homePitcher.era,
-            fip: homePitcher.fip,
-            kPer9: homePitcher.kPer9,
-            hrPer9: homePitcher.hrPer9,
-            flyBallRate: homePitcher.flyBallRate,
-          } : null,
-          away: awayPitcher ? {
-            name: awayPitcher.name,
-            era: awayPitcher.era,
-            fip: awayPitcher.fip,
-            kPer9: awayPitcher.kPer9,
-            hrPer9: awayPitcher.hrPer9,
-            flyBallRate: awayPitcher.flyBallRate,
-          } : null,
-        },
-      };
-    })
-  );
-}
-
-app.get("/games", async (req, res) => {
-  try {
-    const now = Date.now();
-    if (cachedGames && (now - lastCacheTime) < CACHE_DURATION_MS) {
-      res.setHeader("X-Cache", "HIT");
-      return res.json(cachedGames);
-    }
-    const games = await fetchGames();
-    cachedGames = games;
-    lastCacheTime = now;
-    res.setHeader("X-Cache", "MISS");
-    res.json(games);
-  } catch (err: any) {
-    if (cachedGames) return res.json(cachedGames);
-    res.status(500).json({ error: "Failed to fetch games data", details: err.message });
-  }
-});
-
-async function refreshCache() {
-  try {
-    console.log("Background cache refresh starting...");
-    const games = await fetchGames();
-    cachedGames = games;
-    lastCacheTime = Date.now();
-    console.log(`Cache refreshed with ${games.length} games`);
-  } catch (err: any) {
-    console.error("Background refresh failed:", err.message);
-  }
-}
-
-function scheduleSettlement() {
-  const now = new Date();
-  const next6am = new Date();
-  next6am.setUTCHours(6, 0, 0, 0);
-  if (now >= next6am) next6am.setUTCDate(next6am.getUTCDate() + 1);
-  const msUntil6am = next6am.getTime() - now.getTime();
-  console.log(`Settlement scheduled in ${Math.round(msUntil6am / 60000)} minutes (next 6am UTC)`);
-  setTimeout(() => {
-    console.log("Running daily settlement...");
-    settlePredictions();
-    setInterval(() => {
-      console.log("Running daily settlement...");
-      settlePredictions();
-    }, 24 * 60 * 60 * 1000);
-  }, msUntil6am);
-}
-
-refreshCache();
-setInterval(refreshCache, 30 * 60 * 1000);
-scheduleSettlement();
-
-export default app;
+  const allSettled = Array.from(predictionStore.values(
