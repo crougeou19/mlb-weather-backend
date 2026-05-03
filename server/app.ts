@@ -682,6 +682,179 @@ async function startup() {
   setInterval(refreshCache, 30 * 60 * 1000);
   scheduleSettlement();
 }
+// ═══════════════════════════════════════════════════════════════
+// POOLZONE ENDPOINTS — paste above your app.listen() line
+// ═══════════════════════════════════════════════════════════════
+
+// ─── MLB SCORES FOR 13-RUN POOL ──────────────────────────────
+interface MLBGame {
+  gameId: number;
+  date: string;
+  homeTeam: string;
+  awayTeam: string;
+  homeScore: number;
+  awayScore: number;
+  status: string;
+}
+
+let cachedMLBScores: MLBGame[] | null = null;
+let mlbCacheTime: number = 0;
+const MLB_CACHE_MS = 15 * 60 * 1000;
+
+async function fetchMLBScores(date?: string): Promise<MLBGame[]> {
+  const now = Date.now();
+  if (!date && cachedMLBScores && now - mlbCacheTime < MLB_CACHE_MS) {
+    return cachedMLBScores;
+  }
+  const targetDate = date || new Date().toLocaleDateString("en-CA", {
+    timeZone: "America/New_York",
+  });
+  const url = `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${targetDate}&hydrate=linescore`;
+  const res = await fetch(url);
+  const data = await res.json() as any;
+  const games: MLBGame[] = [];
+  for (const dateObj of (data.dates || [])) {
+    for (const game of (dateObj.games || [])) {
+      const status = game.status?.detailedState || "Scheduled";
+      const isFinal = status.toLowerCase().includes("final");
+      const inProgress = status.toLowerCase().includes("progress");
+      games.push({
+        gameId: game.gamePk,
+        date: dateObj.date,
+        homeTeam: game.teams?.home?.team?.name || "",
+        awayTeam: game.teams?.away?.team?.name || "",
+        homeScore: isFinal || inProgress ? (game.teams?.home?.score ?? 0) : 0,
+        awayScore: isFinal || inProgress ? (game.teams?.away?.score ?? 0) : 0,
+        status: isFinal ? "Final" : inProgress ? "In Progress" : "Scheduled",
+      });
+    }
+  }
+  if (!date) {
+    cachedMLBScores = games;
+    mlbCacheTime = now;
+  }
+  return games;
+}
+
+app.get("/poolzone/mlb-scores", async (req, res) => {
+  try {
+    const date = req.query.date as string | undefined;
+    const games = await fetchMLBScores(date);
+    res.json({ success: true, date: date || "today", games });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/poolzone/mlb-scores/range", async (req, res) => {
+  try {
+    const { from, to } = req.query as { from: string; to: string };
+    if (!from || !to) return res.status(400).json({ success: false, error: "from and to dates required" });
+    const url = `https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=${from}&endDate=${to}&hydrate=linescore`;
+    const apiRes = await fetch(url);
+    const data = await apiRes.json() as any;
+    const games: MLBGame[] = [];
+    for (const dateObj of (data.dates || [])) {
+      for (const game of (dateObj.games || [])) {
+        const status = game.status?.detailedState || "";
+        const isFinal = status.toLowerCase().includes("final");
+        if (isFinal) {
+          games.push({
+            gameId: game.gamePk,
+            date: dateObj.date,
+            homeTeam: game.teams?.home?.team?.name || "",
+            awayTeam: game.teams?.away?.team?.name || "",
+            homeScore: game.teams?.home?.score ?? 0,
+            awayScore: game.teams?.away?.score ?? 0,
+            status: "Final",
+          });
+        }
+      }
+    }
+    res.json({ success: true, from, to, games });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ─── NFL RESULTS FOR SURVIVOR POOL ───────────────────────────
+interface NFLGame {
+  gameId: number;
+  week: number;
+  season: number;
+  homeTeam: string;
+  awayTeam: string;
+  homeScore: number;
+  awayScore: number;
+  homeWon: boolean;
+  awayWon: boolean;
+  status: string;
+}
+
+let cachedNFLGames: NFLGame[] | null = null;
+let nflCacheTime: number = 0;
+const NFL_CACHE_MS = 60 * 60 * 1000;
+
+async function fetchNFLWeek(week: number, season: number): Promise<NFLGame[]> {
+  const now = Date.now();
+  if (cachedNFLGames && now - nflCacheTime < NFL_CACHE_MS) return cachedNFLGames;
+  const NFL_API_KEY = process.env.NFL_API_KEY;
+  if (!NFL_API_KEY) throw new Error("NFL_API_KEY not set");
+  const url = `https://v1.american-football.api-sports.io/games?league=1&season=${season}&week=${week}`;
+  const apiRes = await fetch(url, {
+    headers: {
+      "x-rapidapi-key": NFL_API_KEY,
+      "x-rapidapi-host": "v1.american-football.api-sports.io",
+    },
+  });
+  const data = await apiRes.json() as any;
+  const games: NFLGame[] = [];
+  for (const game of (data.response || [])) {
+    const isFinal = game.game?.status?.short === "FT";
+    const homeScore = game.scores?.home?.total ?? 0;
+    const awayScore = game.scores?.away?.total ?? 0;
+    games.push({
+      gameId: game.game?.id,
+      week,
+      season,
+      homeTeam: game.teams?.home?.name || "",
+      awayTeam: game.teams?.away?.name || "",
+      homeScore,
+      awayScore,
+      homeWon: isFinal && homeScore > awayScore,
+      awayWon: isFinal && awayScore > homeScore,
+      status: isFinal ? "Final" : game.game?.status?.long || "Scheduled",
+    });
+  }
+  cachedNFLGames = games;
+  nflCacheTime = now;
+  return games;
+}
+
+app.get("/poolzone/nfl-results", async (req, res) => {
+  try {
+    const week = parseInt(req.query.week as string) || 1;
+    const season = parseInt(req.query.season as string) || new Date().getFullYear();
+    const games = await fetchNFLWeek(week, season);
+    const results: Record<string, boolean> = {};
+    for (const g of games) {
+      if (g.status === "Final") {
+        results[g.homeTeam] = g.homeWon;
+        results[g.awayTeam] = g.awayWon;
+      }
+    }
+    res.json({ success: true, week, season, games, results });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// END POOLZONE ENDPOINTS
+// ═══════════════════════════════════════════════════════════════
+
+
+
 
 startup();
 
