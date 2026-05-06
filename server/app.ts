@@ -59,13 +59,11 @@ let seasonWins = 0;
 let seasonLosses = 0;
 let seasonPushes = 0;
 
-// Load persisted data from Redis on startup
 async function loadFromRedis() {
   try {
     console.log("Loading data from Redis...");
     const predictions = await redisGet("predictions");
     const season = await redisGet("season");
-
     if (predictions) {
       predictionStore = new Map(Object.entries(predictions));
       console.log(`Loaded ${predictionStore.size} predictions from Redis`);
@@ -81,7 +79,6 @@ async function loadFromRedis() {
   }
 }
 
-// Save predictions and season record to Redis
 async function saveToRedis() {
   try {
     const predictionsObj = Object.fromEntries(predictionStore);
@@ -115,18 +112,9 @@ async function settlePredictions() {
       const gameId = `${dateStr}_${homeTeamName?.replace(/\s+/g, '_')}`;
       const record = predictionStore.get(gameId);
 
-      if (!record) {
-        console.log(`No prediction found for ${gameId}`);
-        continue;
-      }
-      if (record.settled) {
-        console.log(`Already settled: ${gameId}`);
-        continue;
-      }
-      if (game.status?.abstractGameState !== "Final") {
-        console.log(`Game not final: ${gameId}`);
-        continue;
-      }
+      if (!record) { console.log(`No prediction found for ${gameId}`); continue; }
+      if (record.settled) { console.log(`Already settled: ${gameId}`); continue; }
+      if (game.status?.abstractGameState !== "Final") { console.log(`Game not final: ${gameId}`); continue; }
 
       const homeRuns = game.teams?.home?.score ?? 0;
       const awayRuns = game.teams?.away?.score ?? 0;
@@ -158,14 +146,48 @@ async function settlePredictions() {
 
     const settled = Array.from(predictionStore.values()).filter(p => p.settled).length;
     console.log(`Settlement complete. Total settled: ${settled}, Season: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
-
-    // Save to Redis after settlement
     if (anySettled) await saveToRedis();
 
   } catch (err: any) {
     console.error("Error settling predictions:", err.message);
   }
 }
+
+// ─── BALLPARK FACTORS (2026) ──────────────────────────────────
+// Source: Baseball Savant / FanGraphs park factors
+// 100 = league average, >100 = hitter friendly, <100 = pitcher friendly
+const PARK_FACTORS: Record<string, { runs: number; hr: number; name: string }> = {
+  "Colorado Rockies":      { runs: 124, hr: 117, name: "Coors Field" },
+  "Cincinnati Reds":       { runs: 108, hr: 113, name: "Great American Ball Park" },
+  "Boston Red Sox":        { runs: 107, hr: 103, name: "Fenway Park" },
+  "Philadelphia Phillies": { runs: 106, hr: 108, name: "Citizens Bank Park" },
+  "Texas Rangers":         { runs: 105, hr: 106, name: "Globe Life Field" },
+  "Chicago Cubs":          { runs: 104, hr: 101, name: "Wrigley Field" },
+  "Baltimore Orioles":     { runs: 103, hr: 105, name: "Camden Yards" },
+  "Atlanta Braves":        { runs: 103, hr: 104, name: "Truist Park" },
+  "Minnesota Twins":       { runs: 102, hr: 103, name: "Target Field" },
+  "New York Yankees":      { runs: 102, hr: 110, name: "Yankee Stadium" },
+  "Houston Astros":        { runs: 101, hr: 98,  name: "Minute Maid Park" },
+  "Los Angeles Angels":    { runs: 101, hr: 102, name: "Angel Stadium" },
+  "Kansas City Royals":    { runs: 100, hr: 99,  name: "Kauffman Stadium" },
+  "Detroit Tigers":        { runs: 100, hr: 98,  name: "Comerica Park" },
+  "Toronto Blue Jays":     { runs: 100, hr: 101, name: "Rogers Centre" },
+  "Milwaukee Brewers":     { runs: 99,  hr: 97,  name: "American Family Field" },
+  "Washington Nationals":  { runs: 99,  hr: 100, name: "Nationals Park" },
+  "Pittsburgh Pirates":    { runs: 99,  hr: 96,  name: "PNC Park" },
+  "St. Louis Cardinals":   { runs: 98,  hr: 97,  name: "Busch Stadium" },
+  "Chicago White Sox":     { runs: 98,  hr: 99,  name: "Guaranteed Rate Field" },
+  "New York Mets":         { runs: 97,  hr: 96,  name: "Citi Field" },
+  "Cleveland Guardians":   { runs: 97,  hr: 94,  name: "Progressive Field" },
+  "Tampa Bay Rays":        { runs: 97,  hr: 96,  name: "Tropicana Field" },
+  "Arizona Diamondbacks":  { runs: 96,  hr: 97,  name: "Chase Field" },
+  "Los Angeles Dodgers":   { runs: 96,  hr: 95,  name: "Dodger Stadium" },
+  "Miami Marlins":         { runs: 95,  hr: 93,  name: "loanDepot park" },
+  "Seattle Mariners":      { runs: 95,  hr: 92,  name: "T-Mobile Park" },
+  "Oakland Athletics":     { runs: 94,  hr: 93,  name: "Oakland Coliseum" },
+  "San Francisco Giants":  { runs: 93,  hr: 88,  name: "Oracle Park" },
+  "San Diego Padres":      { runs: 92,  hr: 89,  name: "Petco Park" },
+};
 
 // ─── PITCHER STATS ────────────────────────────────────────────
 interface PitcherStats {
@@ -233,9 +255,7 @@ async function fetchProbablePitchers(date: string): Promise<Map<string, { home: 
       const homeTeam = game.teams?.home?.team?.name;
       const homePitcher = game.teams?.home?.probablePitcher;
       const awayPitcher = game.teams?.away?.probablePitcher;
-      if (homeTeam) {
-        map.set(homeTeam, { home: homePitcher, away: awayPitcher });
-      }
+      if (homeTeam) map.set(homeTeam, { home: homePitcher, away: awayPitcher });
     }
   } catch (err: any) {
     console.error("Failed to fetch probable pitchers:", err.message);
@@ -245,7 +265,6 @@ async function fetchProbablePitchers(date: string): Promise<Map<string, { home: 
 
 function calculatePitcherScore(pitcher: PitcherStats | null): number {
   if (!pitcher || pitcher.inningsPitched < 5) return 0;
-
   let score = 0;
 
   if (pitcher.era < 2.50) score -= 12;
@@ -284,18 +303,11 @@ function calculatePitcherScore(pitcher: PitcherStats | null): number {
 }
 
 // ─── STADIUM DATA ─────────────────────────────────────────────
-const FIXED_DOME_STADIUMS = new Set([
-  "Tampa Bay Rays",
-]);
+const FIXED_DOME_STADIUMS = new Set(["Tampa Bay Rays"]);
 
 const RETRACTABLE_ROOF_STADIUMS = new Set([
-  "Houston Astros",
-  "Milwaukee Brewers",
-  "Seattle Mariners",
-  "Arizona Diamondbacks",
-  "Texas Rangers",
-  "Miami Marlins",
-  "Toronto Blue Jays",
+  "Houston Astros", "Milwaukee Brewers", "Seattle Mariners",
+  "Arizona Diamondbacks", "Texas Rangers", "Miami Marlins", "Toronto Blue Jays",
 ]);
 
 const STADIUM_COORDS: Record<string, { lat: number; lon: number; name: string }> = {
@@ -351,7 +363,7 @@ function getWindType(windDeg: number, stadiumOrientation: number): "OUT" | "IN" 
   return "CROSS";
 }
 
-function calculateEdge({ windSpeed, windType, temp, humidity, total, isFixedDome, isRetractable, homePitcherScore, awayPitcherScore }: {
+function calculateEdge({ windSpeed, windType, temp, humidity, total, isFixedDome, isRetractable, homePitcherScore, awayPitcherScore, parkFactor }: {
   windSpeed: number;
   windType: "OUT" | "IN" | "CROSS";
   temp: number;
@@ -361,9 +373,11 @@ function calculateEdge({ windSpeed, windType, temp, humidity, total, isFixedDome
   isRetractable: boolean;
   homePitcherScore: number;
   awayPitcherScore: number;
+  parkFactor: number;
 }) {
   let score = 0;
 
+  // ── Weather (skip for fixed dome) ──
   if (!isFixedDome) {
     if (windType === "OUT") score += windSpeed * 1.5;
     if (windType === "IN") score -= windSpeed * 1.5;
@@ -380,8 +394,16 @@ function calculateEdge({ windSpeed, windType, temp, humidity, total, isFixedDome
     if (temp >= 85 && humidity < 50) score += 5;
   }
 
+  // ── Pitcher score ──
   const pitcherScore = (homePitcherScore + awayPitcherScore) / 2;
   score += pitcherScore;
+
+  // ── Park factor adjustment ──
+  // (parkFactor - 100) gives deviation from neutral
+  // Scaled to max ±6 points for extreme parks like Coors (+24) or Petco (-8)
+  const parkDeviation = parkFactor - 100;
+  const parkScore = parkDeviation * 0.25;
+  score += parkScore;
 
   const runsAdded = score / 20;
   const adjustedTotal = total + runsAdded;
@@ -402,6 +424,8 @@ function calculateEdge({ windSpeed, windType, temp, humidity, total, isFixedDome
     isFixedDome,
     isRetractable,
     pitcherScore: Math.round(pitcherScore),
+    parkScore: Math.round(parkScore),
+    parkFactor,
   };
 }
 
@@ -425,7 +449,7 @@ app.get("/results", (req, res) => {
   const yesterdayPushes = yesterdayResults.filter(p => p.result === "PUSH").length;
   const yesterdayTotal = yesterdayWins + yesterdayLosses;
 
- const allSettled = Array.from(predictionStore.values()).filter(p => p.settled && p.result);
+  const allSettled = Array.from(predictionStore.values()).filter(p => p.settled && p.result);
   const highConfSettled = allSettled.filter(p => p.confidence === "HIGH");
   const highConfWins = highConfSettled.filter(p => p.result === "WIN").length;
   const highConfLosses = highConfSettled.filter(p => p.result === "LOSS").length;
@@ -472,6 +496,130 @@ app.get("/results", (req, res) => {
   });
 });
 
+// ─── NFL SCORES (ESPN API) ────────────────────────────────────
+app.get("/nfl-scores", async (req, res) => {
+  try {
+    const espnRes = await fetch(
+      "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=2"
+    );
+    if (!espnRes.ok) throw new Error(`ESPN API error: ${espnRes.status}`);
+    const data = await espnRes.json() as any;
+
+    const games = (data.events || []).map((event: any) => {
+      const competition = event.competitions?.[0];
+      const home = competition?.competitors?.find((c: any) => c.homeAway === "home");
+      const away = competition?.competitors?.find((c: any) => c.homeAway === "away");
+      const status = competition?.status?.type?.name;
+      const isFinal = status === "STATUS_FINAL";
+
+      return {
+        gameId: event.id,
+        week: data.week?.number ?? null,
+        season: data.season?.year ?? null,
+        homeTeam: home?.team?.displayName ?? "",
+        homeAbbr: home?.team?.abbreviation ?? "",
+        awayTeam: away?.team?.displayName ?? "",
+        awayAbbr: away?.team?.abbreviation ?? "",
+        homeScore: isFinal ? parseInt(home?.score ?? "0") : null,
+        awayScore: isFinal ? parseInt(away?.score ?? "0") : null,
+        homeWon: isFinal ? parseInt(home?.score ?? "0") > parseInt(away?.score ?? "0") : null,
+        awayWon: isFinal ? parseInt(away?.score ?? "0") > parseInt(home?.score ?? "0") : null,
+        status: isFinal ? "Final" : competition?.status?.type?.description ?? "Scheduled",
+        date: event.date,
+      };
+    }).filter((g: any) => g.status === "Final");
+
+    res.json({ success: true, week: data.week?.number, season: data.season?.year, games });
+  } catch (err: any) {
+    console.error("NFL scores error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── MLB SCORES (for PoolZone 13-run pool) ───────────────────
+interface MLBGame {
+  gameId: number;
+  date: string;
+  homeTeam: string;
+  awayTeam: string;
+  homeScore: number;
+  awayScore: number;
+  status: string;
+}
+
+let cachedMLBScores: MLBGame[] | null = null;
+let mlbCacheTime: number = 0;
+const MLB_CACHE_MS = 15 * 60 * 1000;
+
+async function fetchMLBScores(date?: string): Promise<MLBGame[]> {
+  const now = Date.now();
+  if (!date && cachedMLBScores && now - mlbCacheTime < MLB_CACHE_MS) return cachedMLBScores;
+  const targetDate = date || new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  const url = `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${targetDate}&hydrate=linescore`;
+  const res = await fetch(url);
+  const data = await res.json() as any;
+  const games: MLBGame[] = [];
+  for (const dateObj of (data.dates || [])) {
+    for (const game of (dateObj.games || [])) {
+      const status = game.status?.detailedState || "Scheduled";
+      const isFinal = status.toLowerCase().includes("final");
+      const inProgress = status.toLowerCase().includes("progress");
+      games.push({
+        gameId: game.gamePk,
+        date: dateObj.date,
+        homeTeam: game.teams?.home?.team?.name || "",
+        awayTeam: game.teams?.away?.team?.name || "",
+        homeScore: isFinal || inProgress ? (game.teams?.home?.score ?? 0) : 0,
+        awayScore: isFinal || inProgress ? (game.teams?.away?.score ?? 0) : 0,
+        status: isFinal ? "Final" : inProgress ? "In Progress" : "Scheduled",
+      });
+    }
+  }
+  if (!date) { cachedMLBScores = games; mlbCacheTime = now; }
+  return games;
+}
+
+app.get("/poolzone/mlb-scores", async (req, res) => {
+  try {
+    const date = req.query.date as string | undefined;
+    const games = await fetchMLBScores(date);
+    res.json({ success: true, date: date || "today", games });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/poolzone/mlb-scores/range", async (req, res) => {
+  try {
+    const { from, to } = req.query as { from: string; to: string };
+    if (!from || !to) return res.status(400).json({ success: false, error: "from and to dates required" });
+    const url = `https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=${from}&endDate=${to}&hydrate=linescore`;
+    const apiRes = await fetch(url);
+    const data = await apiRes.json() as any;
+    const games: MLBGame[] = [];
+    for (const dateObj of (data.dates || [])) {
+      for (const game of (dateObj.games || [])) {
+        const status = game.status?.detailedState || "";
+        const isFinal = status.toLowerCase().includes("final");
+        if (isFinal) {
+          games.push({
+            gameId: game.gamePk,
+            date: dateObj.date,
+            homeTeam: game.teams?.home?.team?.name || "",
+            awayTeam: game.teams?.away?.team?.name || "",
+            homeScore: game.teams?.home?.score ?? 0,
+            awayScore: game.teams?.away?.score ?? 0,
+            status: "Final",
+          });
+        }
+      }
+    }
+    res.json({ success: true, from, to, games });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 async function fetchGames() {
   const today = new Date().toISOString().split("T")[0];
   const probablePitchers = await fetchProbablePitchers(today);
@@ -497,6 +645,10 @@ async function fetchGames() {
       const commenceTime = game.commence_time;
       const isFixedDome = FIXED_DOME_STADIUMS.has(homeTeam);
       const isRetractable = RETRACTABLE_ROOF_STADIUMS.has(homeTeam);
+
+      // Get park factor for home team
+      const parkData = PARK_FACTORS[homeTeam] ?? { runs: 100, hr: 100, name: "Unknown" };
+      const parkFactor = parkData.runs;
 
       const bookmaker = game.bookmakers?.find((b: any) => b.key === 'draftkings')
         ?? game.bookmakers?.find((b: any) => b.key === 'fanduel')
@@ -571,6 +723,7 @@ async function fetchGames() {
                 isRetractable,
                 homePitcherScore,
                 awayPitcherScore,
+                parkFactor,
               });
 
               const gameId = `${today}_${homeTeam.replace(/\s+/g, '_')}`;
@@ -604,6 +757,13 @@ async function fetchGames() {
         away_ml: awayML,
         weather,
         edge,
+        park: {
+          factor: parkFactor,
+          hrFactor: parkData.hr,
+          name: parkData.name,
+          hitterFriendly: parkFactor > 102,
+          pitcherFriendly: parkFactor < 98,
+        },
         pitchers: {
           home: homePitcher ? {
             name: homePitcher.name,
@@ -682,179 +842,6 @@ async function startup() {
   setInterval(refreshCache, 30 * 60 * 1000);
   scheduleSettlement();
 }
-// ═══════════════════════════════════════════════════════════════
-// POOLZONE ENDPOINTS — paste above your app.listen() line
-// ═══════════════════════════════════════════════════════════════
-
-// ─── MLB SCORES FOR 13-RUN POOL ──────────────────────────────
-interface MLBGame {
-  gameId: number;
-  date: string;
-  homeTeam: string;
-  awayTeam: string;
-  homeScore: number;
-  awayScore: number;
-  status: string;
-}
-
-let cachedMLBScores: MLBGame[] | null = null;
-let mlbCacheTime: number = 0;
-const MLB_CACHE_MS = 15 * 60 * 1000;
-
-async function fetchMLBScores(date?: string): Promise<MLBGame[]> {
-  const now = Date.now();
-  if (!date && cachedMLBScores && now - mlbCacheTime < MLB_CACHE_MS) {
-    return cachedMLBScores;
-  }
-  const targetDate = date || new Date().toLocaleDateString("en-CA", {
-    timeZone: "America/New_York",
-  });
-  const url = `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${targetDate}&hydrate=linescore`;
-  const res = await fetch(url);
-  const data = await res.json() as any;
-  const games: MLBGame[] = [];
-  for (const dateObj of (data.dates || [])) {
-    for (const game of (dateObj.games || [])) {
-      const status = game.status?.detailedState || "Scheduled";
-      const isFinal = status.toLowerCase().includes("final");
-      const inProgress = status.toLowerCase().includes("progress");
-      games.push({
-        gameId: game.gamePk,
-        date: dateObj.date,
-        homeTeam: game.teams?.home?.team?.name || "",
-        awayTeam: game.teams?.away?.team?.name || "",
-        homeScore: isFinal || inProgress ? (game.teams?.home?.score ?? 0) : 0,
-        awayScore: isFinal || inProgress ? (game.teams?.away?.score ?? 0) : 0,
-        status: isFinal ? "Final" : inProgress ? "In Progress" : "Scheduled",
-      });
-    }
-  }
-  if (!date) {
-    cachedMLBScores = games;
-    mlbCacheTime = now;
-  }
-  return games;
-}
-
-app.get("/poolzone/mlb-scores", async (req, res) => {
-  try {
-    const date = req.query.date as string | undefined;
-    const games = await fetchMLBScores(date);
-    res.json({ success: true, date: date || "today", games });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.get("/poolzone/mlb-scores/range", async (req, res) => {
-  try {
-    const { from, to } = req.query as { from: string; to: string };
-    if (!from || !to) return res.status(400).json({ success: false, error: "from and to dates required" });
-    const url = `https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=${from}&endDate=${to}&hydrate=linescore`;
-    const apiRes = await fetch(url);
-    const data = await apiRes.json() as any;
-    const games: MLBGame[] = [];
-    for (const dateObj of (data.dates || [])) {
-      for (const game of (dateObj.games || [])) {
-        const status = game.status?.detailedState || "";
-        const isFinal = status.toLowerCase().includes("final");
-        if (isFinal) {
-          games.push({
-            gameId: game.gamePk,
-            date: dateObj.date,
-            homeTeam: game.teams?.home?.team?.name || "",
-            awayTeam: game.teams?.away?.team?.name || "",
-            homeScore: game.teams?.home?.score ?? 0,
-            awayScore: game.teams?.away?.score ?? 0,
-            status: "Final",
-          });
-        }
-      }
-    }
-    res.json({ success: true, from, to, games });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ─── NFL RESULTS FOR SURVIVOR POOL ───────────────────────────
-interface NFLGame {
-  gameId: number;
-  week: number;
-  season: number;
-  homeTeam: string;
-  awayTeam: string;
-  homeScore: number;
-  awayScore: number;
-  homeWon: boolean;
-  awayWon: boolean;
-  status: string;
-}
-
-let cachedNFLGames: NFLGame[] | null = null;
-let nflCacheTime: number = 0;
-const NFL_CACHE_MS = 60 * 60 * 1000;
-
-async function fetchNFLWeek(week: number, season: number): Promise<NFLGame[]> {
-  const now = Date.now();
-  if (cachedNFLGames && now - nflCacheTime < NFL_CACHE_MS) return cachedNFLGames;
-  const NFL_API_KEY = process.env.NFL_API_KEY;
-  if (!NFL_API_KEY) throw new Error("NFL_API_KEY not set");
-  const url = `https://v1.american-football.api-sports.io/games?league=1&season=${season}&week=${week}`;
-  const apiRes = await fetch(url, {
-    headers: {
-      "x-rapidapi-key": NFL_API_KEY,
-      "x-rapidapi-host": "v1.american-football.api-sports.io",
-    },
-  });
-  const data = await apiRes.json() as any;
-  const games: NFLGame[] = [];
-  for (const game of (data.response || [])) {
-    const isFinal = game.game?.status?.short === "FT";
-    const homeScore = game.scores?.home?.total ?? 0;
-    const awayScore = game.scores?.away?.total ?? 0;
-    games.push({
-      gameId: game.game?.id,
-      week,
-      season,
-      homeTeam: game.teams?.home?.name || "",
-      awayTeam: game.teams?.away?.name || "",
-      homeScore,
-      awayScore,
-      homeWon: isFinal && homeScore > awayScore,
-      awayWon: isFinal && awayScore > homeScore,
-      status: isFinal ? "Final" : game.game?.status?.long || "Scheduled",
-    });
-  }
-  cachedNFLGames = games;
-  nflCacheTime = now;
-  return games;
-}
-
-app.get("/poolzone/nfl-results", async (req, res) => {
-  try {
-    const week = parseInt(req.query.week as string) || 1;
-    const season = parseInt(req.query.season as string) || new Date().getFullYear();
-    const games = await fetchNFLWeek(week, season);
-    const results: Record<string, boolean> = {};
-    for (const g of games) {
-      if (g.status === "Final") {
-        results[g.homeTeam] = g.homeWon;
-        results[g.awayTeam] = g.awayWon;
-      }
-    }
-    res.json({ success: true, week, season, games, results });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════
-// END POOLZONE ENDPOINTS
-// ═══════════════════════════════════════════════════════════════
-
-
-
 
 startup();
 
