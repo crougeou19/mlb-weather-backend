@@ -842,7 +842,184 @@ async function startup() {
   setInterval(refreshCache, 30 * 60 * 1000);
   scheduleSettlement();
 }
+// ═══════════════════════════════════════════════════════════════
+// POOLZONE AUTO-SYNC — Firebase Admin + Cron Jobs
+// ═══════════════════════════════════════════════════════════════
+import * as admin from 'firebase-admin';
+import * as cron from 'node-cron';
 
+// Initialize Firebase Admin
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+}
+const db = admin.firestore();
+
+// ── Fetch all leagues from Firestore ──
+async function getAllLeagues() {
+  const snap = await db.collection('leagues').get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+// ── Auto-sync MLB scores into all 13-Run pools ──
+async function autoSyncMLBScores() {
+  console.log('[PoolZone] Running MLB auto-sync...');
+  try {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const url = `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${today}&hydrate=linescore`;
+    const res = await fetch(url);
+    const data = await res.json() as any;
+
+    const finalGames: { homeTeam: string; awayTeam: string; homeScore: number; awayScore: number }[] = [];
+    for (const dateObj of (data.dates || [])) {
+      for (const game of (dateObj.games || [])) {
+        const status = game.status?.detailedState || '';
+        if (status.toLowerCase().includes('final')) {
+          finalGames.push({
+            homeTeam: game.teams?.home?.team?.name || '',
+            awayTeam: game.teams?.away?.team?.name || '',
+            homeScore: game.teams?.home?.score ?? 0,
+            awayScore: game.teams?.away?.score ?? 0,
+          });
+        }
+      }
+    }
+
+    if (!finalGames.length) {
+      console.log('[PoolZone] No final MLB games today.');
+      return;
+    }
+
+    const leagues = await getAllLeagues();
+    let totalUpdates = 0;
+
+    for (const league of leagues) {
+      const thirteen = (league as any).thirteen || {};
+      const assignments = thirteen.assignments || [];
+      if (!assignments.length || !thirteen.drawn) continue;
+
+      let changed = false;
+      for (const game of finalGames) {
+        const teams = [
+          { name: game.homeTeam, score: game.homeScore },
+          { name: game.awayTeam, score: game.awayScore },
+        ];
+        for (const t of teams) {
+          const player = assignments.find((a: any) => a.team === t.name && !a.benched);
+          if (!player) continue;
+          if (t.score >= 0 && t.score <= 13) {
+            player.hits = player.hits || {};
+            player.hits[t.score] = (player.hits[t.score] || 0) + 1;
+            changed = true;
+            totalUpdates++;
+          }
+        }
+      }
+
+      if (changed) {
+        await db.collection('leagues').doc(league.id).update({
+          'thirteen.assignments': assignments,
+        });
+        console.log(`[PoolZone] Updated league ${league.id}`);
+      }
+    }
+
+    console.log(`[PoolZone] MLB sync complete. ${totalUpdates} scores updated across ${leagues.length} leagues.`);
+  } catch (e) {
+    console.error('[PoolZone] MLB sync error:', e);
+  }
+}
+
+// ── Auto-sync NFL results into all Survivor pools ──
+async function autoSyncNFLResults() {
+  console.log('[PoolZone] Running NFL auto-sync...');
+  try {
+    const NFL_API_KEY = process.env.NFL_API_KEY;
+    if (!NFL_API_KEY) { console.warn('[PoolZone] NFL_API_KEY not set'); return; }
+
+    const now = new Date();
+    const season = now.getFullYear();
+    const seasonStart = new Date(season, 8, 5);
+    const weekNum = Math.max(1, Math.ceil((now.getTime() - seasonStart.getTime()) / (7 * 24 * 60 * 60 * 1000)));
+    const week = Math.min(weekNum, 18);
+
+    const url = `https://v1.american-football.api-sports.io/games?league=1&season=${season}&week=${week}`;
+    const apiRes = await fetch(url, {
+      headers: {
+        'x-rapidapi-key': NFL_API_KEY,
+        'x-rapidapi-host': 'v1.american-football.api-sports.io',
+      },
+    });
+    const data = await apiRes.json() as any;
+
+    const results: Record<string, boolean> = {};
+    for (const game of (data.response || [])) {
+      if (game.game?.status?.short !== 'FT') continue;
+      const homeScore = game.scores?.home?.total ?? 0;
+      const awayScore = game.scores?.away?.total ?? 0;
+      results[game.teams?.home?.name || ''] = homeScore > awayScore;
+      results[game.teams?.away?.name || ''] = awayScore > homeScore;
+    }
+
+    if (!Object.keys(results).length) {
+      console.log('[PoolZone] No final NFL games found.');
+      return;
+    }
+
+    const leagues = await getAllLeagues();
+    for (const league of leagues) {
+      const survivor = (league as any).survivor || {};
+      const players = survivor.players || [];
+      const currentWeek = survivor.currentWeek || 1;
+      if (!players.length) continue;
+
+      let changed = false;
+      for (const player of players) {
+        const pick = player.picks?.[currentWeek];
+        if (!pick?.team || !player.alive) continue;
+        const won = Object.entries(results).find(([team]) =>
+          team.toLowerCase().includes(pick.team.toLowerCase()) ||
+          pick.team.toLowerCase().includes(team.toLowerCase())
+        );
+        if (won !== undefined) {
+          pick.result = won[1] ? 'W' : 'L';
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        await db.collection('leagues').doc(league.id).update({
+          'survivor.players': players,
+        });
+        console.log(`[PoolZone] Updated survivor league ${league.id}`);
+      }
+    }
+    console.log('[PoolZone] NFL sync complete.');
+  } catch (e) {
+    console.error('[PoolZone] NFL sync error:', e);
+  }
+}
+
+// ── Cron Jobs ──
+// MLB: Every hour 6pm-midnight Eastern (11pm-5am UTC)
+cron.schedule('0 23,0,1,2,3,4,5 * * *', () => {
+  autoSyncMLBScores();
+});
+
+// NFL: Every Monday at 2am Eastern (7am UTC) during NFL season (Sep-Feb)
+cron.schedule('0 7 * * 1', () => {
+  const month = new Date().getMonth();
+  if (month >= 8 || month <= 1) { // Sep(8) through Feb(1)
+    autoSyncNFLResults();
+  }
+});
+
+console.log('[PoolZone] Auto-sync cron jobs scheduled ✓');
+// ═══════════════════════════════════════════════════════════════
+// END POOLZONE AUTO-SYNC
+// ═══════════════════════════════════════════════════════════════
 startup();
 
 export default app;
