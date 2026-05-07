@@ -246,19 +246,7 @@ const NFL_PARK_FACTORS: Record<string, number> = {
   "Tennessee Titans": 99, "Washington Commanders": 97,
 };
 
-// ─── MLB TEAM STATS CACHE ─────────────────────────────────────
-interface TeamStats {
-  teamId: number;
-  runsPerGame: number;
-  last10RunsPerGame: number;
-  bullpenEra: number;
-  gamesPlayed: number;
-}
-
-const teamStatsCache: Map<string, { data: TeamStats; time: number }> = new Map();
-const TEAM_STATS_TTL = 3 * 60 * 60 * 1000; // 3 hours
-
-// MLB team ID lookup
+// ─── MLB TEAM IDS ─────────────────────────────────────────────
 const MLB_TEAM_IDS: Record<string, number> = {
   "Arizona Diamondbacks": 109, "Atlanta Braves": 144, "Baltimore Orioles": 110,
   "Boston Red Sox": 111, "Chicago Cubs": 112, "Chicago White Sox": 145,
@@ -272,6 +260,18 @@ const MLB_TEAM_IDS: Record<string, number> = {
   "Texas Rangers": 140, "Toronto Blue Jays": 141, "Washington Nationals": 120,
 };
 
+// ─── TEAM STATS CACHE ─────────────────────────────────────────
+interface TeamStats {
+  teamId: number;
+  runsPerGame: number;
+  last10RunsPerGame: number;
+  bullpenEra: number;
+  gamesPlayed: number;
+}
+
+const teamStatsCache: Map<string, { data: TeamStats; time: number }> = new Map();
+const TEAM_STATS_TTL = 3 * 60 * 60 * 1000;
+
 async function fetchTeamStats(teamName: string): Promise<TeamStats | null> {
   const cached = teamStatsCache.get(teamName);
   if (cached && Date.now() - cached.time < TEAM_STATS_TTL) return cached.data;
@@ -282,7 +282,6 @@ async function fetchTeamStats(teamName: string): Promise<TeamStats | null> {
   try {
     const season = new Date().getFullYear();
 
-    // Fetch season hitting stats
     const hittingRes = await fetch(
       `https://statsapi.mlb.com/api/v1/teams/${teamId}/stats?stats=season&group=hitting&season=${season}`
     );
@@ -292,7 +291,6 @@ async function fetchTeamStats(teamName: string): Promise<TeamStats | null> {
     const runsScored = parseInt(hitting?.runs ?? "0");
     const runsPerGame = gamesPlayed > 0 ? runsScored / gamesPlayed : 4.5;
 
-    // Fetch last 10 games hitting stats
     const last10Res = await fetch(
       `https://statsapi.mlb.com/api/v1/teams/${teamId}/stats?stats=lastXGames&group=hitting&season=${season}&limit=10`
     );
@@ -302,16 +300,12 @@ async function fetchTeamStats(teamName: string): Promise<TeamStats | null> {
     const last10Runs = parseInt(last10?.runs ?? "0");
     const last10RunsPerGame = last10Games > 0 ? last10Runs / last10Games : runsPerGame;
 
-    // Fetch bullpen ERA
     const bullpenRes = await fetch(
       `https://statsapi.mlb.com/api/v1/teams/${teamId}/stats?stats=season&group=pitching&season=${season}`
     );
     const bullpenData = await bullpenRes.json() as any;
     const pitching = bullpenData?.stats?.[0]?.splits?.[0]?.stat;
     const teamEra = parseFloat(pitching?.era ?? "4.20");
-
-    // Estimate bullpen ERA — team ERA skews toward starters
-    // Bullpen typically 0.3-0.5 higher than starter ERA
     const bullpenEra = teamEra + 0.35;
 
     const stats: TeamStats = {
@@ -324,7 +318,6 @@ async function fetchTeamStats(teamName: string): Promise<TeamStats | null> {
 
     teamStatsCache.set(teamName, { data: stats, time: Date.now() });
     return stats;
-
   } catch (err: any) {
     console.error(`Failed to fetch team stats for ${teamName}:`, err.message);
     return null;
@@ -334,9 +327,8 @@ async function fetchTeamStats(teamName: string): Promise<TeamStats | null> {
 function calculateTeamOffenseScore(stats: TeamStats | null): number {
   if (!stats || stats.gamesPlayed < 10) return 0;
   let score = 0;
-
-  // Season runs per game vs league average (~4.5)
   const leagueAvg = 4.5;
+
   const seasonDiff = stats.runsPerGame - leagueAvg;
   if (seasonDiff > 1.0) score += 8;
   else if (seasonDiff > 0.5) score += 5;
@@ -345,7 +337,6 @@ function calculateTeamOffenseScore(stats: TeamStats | null): number {
   else if (seasonDiff < -0.5) score -= 5;
   else if (seasonDiff < -0.2) score -= 2;
 
-  // Recent form (last 10 games) — weighted more heavily
   const formDiff = stats.last10RunsPerGame - leagueAvg;
   if (formDiff > 1.0) score += 6;
   else if (formDiff > 0.5) score += 4;
@@ -361,8 +352,6 @@ function calculateBullpenScore(stats: TeamStats | null): number {
   if (!stats || stats.gamesPlayed < 10) return 0;
   let score = 0;
 
-  // Lower bullpen ERA = UNDER lean, Higher = OVER lean
-  const leagueAvg = 4.55; // league avg bullpen ERA
   if (stats.bullpenEra < 3.50) score -= 8;
   else if (stats.bullpenEra < 4.00) score -= 5;
   else if (stats.bullpenEra < 4.25) score -= 2;
@@ -547,18 +536,14 @@ function getWindType(windDeg: number, stadiumOrientation: number): "OUT" | "IN" 
   return "CROSS";
 }
 
-// ─── DAY/NIGHT TEMPERATURE ADJUSTMENT ────────────────────────
 function adjustTempForGameTime(temp: number, commenceTime: string): number {
   try {
     const gameHour = new Date(commenceTime).getHours();
-    // Night games (after 5pm local) — temperature drops
     if (gameHour >= 17) {
-      // Evening games cool down as night progresses
       const hoursPastNoon = gameHour - 12;
-      const tempDrop = Math.min(hoursPastNoon * 1.5, 12); // max 12°F drop
+      const tempDrop = Math.min(hoursPastNoon * 1.5, 12);
       return Math.round(temp - tempDrop);
     }
-    // Day games (before 5pm) — use current temp as-is
     return temp;
   } catch (e) {
     return temp;
@@ -569,28 +554,18 @@ function calculateEdge({
   windSpeed, windType, temp, humidity, total,
   isFixedDome, isRetractable,
   homePitcherScore, awayPitcherScore,
-  parkFactor,
-  homeOffenseScore, awayOffenseScore,
+  parkFactor, homeOffenseScore, awayOffenseScore,
   homeBullpenScore, awayBullpenScore,
 }: {
-  windSpeed: number;
-  windType: "OUT" | "IN" | "CROSS";
-  temp: number;
-  humidity: number;
-  total: number;
-  isFixedDome: boolean;
-  isRetractable: boolean;
-  homePitcherScore: number;
-  awayPitcherScore: number;
-  parkFactor: number;
-  homeOffenseScore: number;
-  awayOffenseScore: number;
-  homeBullpenScore: number;
-  awayBullpenScore: number;
+  windSpeed: number; windType: "OUT" | "IN" | "CROSS";
+  temp: number; humidity: number; total: number;
+  isFixedDome: boolean; isRetractable: boolean;
+  homePitcherScore: number; awayPitcherScore: number;
+  parkFactor: number; homeOffenseScore: number; awayOffenseScore: number;
+  homeBullpenScore: number; awayBullpenScore: number;
 }) {
   let score = 0;
 
-  // ── Weather (skip for fixed dome) ──
   if (!isFixedDome) {
     if (windType === "OUT") score += windSpeed * 1.5;
     if (windType === "IN") score -= windSpeed * 1.5;
@@ -607,26 +582,21 @@ function calculateEdge({
     if (temp >= 85 && humidity < 50) score += 5;
   }
 
-  // ── Starting pitcher score (averaged) ──
   const pitcherScore = (homePitcherScore + awayPitcherScore) / 2;
   score += pitcherScore;
 
-  // ── Bullpen score (averaged) ──
   const bullpenScore = (homeBullpenScore + awayBullpenScore) / 2;
   score += bullpenScore;
 
-  // ── Offense score (averaged — both teams scoring ability) ──
   const offenseScore = (homeOffenseScore + awayOffenseScore) / 2;
   score += offenseScore;
 
-  // ── Park factor ──
   const parkScore = (parkFactor - 100) * 0.25;
   score += parkScore;
 
   const runsAdded = score / 20;
   const adjustedTotal = total + runsAdded;
 
-  // ── Raised thresholds to account for additional factors ──
   let play = "NO EDGE";
   let confidence = "LOW";
   if (score >= 28) { play = "OVER"; confidence = "HIGH"; }
@@ -635,13 +605,10 @@ function calculateEdge({
   else if (score <= -16) { play = "UNDER"; confidence = "MEDIUM"; }
 
   return {
-    score: Math.round(score),
-    play,
-    confidence,
+    score: Math.round(score), play, confidence,
     runsAdded: Number(runsAdded.toFixed(1)),
     adjustedTotal: Number(adjustedTotal.toFixed(1)),
-    isFixedDome,
-    isRetractable,
+    isFixedDome, isRetractable,
     breakdown: {
       pitcherScore: Math.round(pitcherScore),
       bullpenScore: Math.round(bullpenScore),
@@ -736,7 +703,6 @@ app.get("/results", (req, res) => {
   const yesterdayHighWins = yesterdayHigh.filter(p => p.result === "WIN").length;
   const yesterdayHighLosses = yesterdayHigh.filter(p => p.result === "LOSS").length;
   const yesterdayHighTotal = yesterdayHighWins + yesterdayHighLosses;
-
   const seasonTotal = seasonWins + seasonLosses;
 
   res.json({
@@ -892,7 +858,7 @@ app.get("/nfl-scores", async (req, res) => {
   }
 });
 
-// ─── MLB SCORES (PoolZone) ────────────────────────────────────
+// ─── MLB POOLZONE SCORES ──────────────────────────────────────
 interface MLBGame {
   gameId: number; date: string;
   homeTeam: string; awayTeam: string;
@@ -963,6 +929,136 @@ app.get("/poolzone/mlb-scores/range", async (req, res) => {
   }
 });
 
+// ─── VENUE STATS ──────────────────────────────────────────────
+const venueStatsCache: Map<string, { data: any; time: number }> = new Map();
+const VENUE_STATS_TTL = 6 * 60 * 60 * 1000;
+
+app.get("/venue-stats", async (req, res) => {
+  const homeTeam = req.query.team as string;
+  const homePitcherId = req.query.homePitcherId as string;
+  const awayPitcherId = req.query.awayPitcherId as string;
+  const homePitcherName = req.query.homePitcherName as string;
+  const awayPitcherName = req.query.awayPitcherName as string;
+
+  if (!homeTeam) return res.status(400).json({ error: "team parameter required" });
+
+  const cacheKey = `venue_${homeTeam}_${homePitcherId}_${awayPitcherId}`;
+  const cached = venueStatsCache.get(cacheKey);
+  if (cached && Date.now() - cached.time < VENUE_STATS_TTL) return res.json(cached.data);
+
+  try {
+    const teamId = MLB_TEAM_IDS[homeTeam];
+    if (!teamId) return res.status(404).json({ error: "Team not found" });
+
+    const currentYear = new Date().getFullYear();
+    const seasons = [currentYear, currentYear - 1, currentYear - 2];
+
+    // Fetch home games across 3 seasons
+    let allGames: any[] = [];
+    for (const season of seasons) {
+      try {
+        const schedRes = await fetch(
+          `https://statsapi.mlb.com/api/v1/schedule?sportId=1&teamId=${teamId}&season=${season}&gameType=R&hydrate=linescore`
+        );
+        const schedData = await schedRes.json() as any;
+        for (const dateObj of (schedData.dates || [])) {
+          for (const game of (dateObj.games || [])) {
+            if (game.teams?.home?.team?.id !== teamId) continue;
+            if (game.status?.abstractGameState !== "Final") continue;
+            const homeScore = game.teams?.home?.score ?? 0;
+            const awayScore = game.teams?.away?.score ?? 0;
+            allGames.push({
+              date: dateObj.date, season,
+              home: game.teams?.home?.team?.name,
+              away: game.teams?.away?.team?.name,
+              homeScore, awayScore,
+              total: homeScore + awayScore,
+            });
+          }
+        }
+      } catch (e) {}
+    }
+
+    allGames.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    const last5Games = allGames.slice(0, 5);
+
+    const avgLine = 8.5;
+    let overs = 0, unders = 0, pushes = 0, totalRunsSum = 0;
+    allGames.forEach(g => {
+      totalRunsSum += g.total;
+      if (g.total > avgLine) overs++;
+      else if (g.total < avgLine) unders++;
+      else pushes++;
+    });
+
+    const totalGames = allGames.length;
+    const venueOURecord = {
+      overs, unders, pushes, totalGames,
+      overPct: totalGames > 0 ? Math.round((overs / totalGames) * 100) : null,
+      avgRunsPerGame: totalGames > 0 ? Number((totalRunsSum / totalGames).toFixed(1)) : null,
+      seasons: `${seasons[seasons.length - 1]}-${seasons[0]}`,
+    };
+
+    // Pitcher venue history
+    async function fetchPitcherVenueStats(pitcherId: string, pitcherName: string) {
+      if (!pitcherId) return null;
+      try {
+        const allVenueStarts: any[] = [];
+        for (const season of seasons) {
+          try {
+            const vRes = await fetch(
+              `https://statsapi.mlb.com/api/v1/people/${pitcherId}/stats?stats=gameLog&group=pitching&season=${season}&opposingTeamId=${teamId}`
+            );
+            const vData = await vRes.json() as any;
+            const vSplits = vData?.stats?.[0]?.splits || [];
+            allVenueStarts.push(...vSplits.map((s: any) => ({ ...s, season })));
+          } catch (e) {}
+        }
+
+        if (!allVenueStarts.length) return {
+          name: pitcherName, startsAtVenue: 0,
+          era: null, record: "No starts at this venue",
+        };
+
+        const totalIP = allVenueStarts.reduce((sum: number, s: any) => sum + parseFloat(s.stat?.inningsPitched ?? "0"), 0);
+        const totalER = allVenueStarts.reduce((sum: number, s: any) => sum + parseInt(s.stat?.earnedRuns ?? "0"), 0);
+        const wins = allVenueStarts.filter((s: any) => s.stat?.wins === 1).length;
+        const losses = allVenueStarts.filter((s: any) => s.stat?.losses === 1).length;
+        const totalK = allVenueStarts.reduce((sum: number, s: any) => sum + parseInt(s.stat?.strikeOuts ?? "0"), 0);
+        const venueEra = totalIP > 0 ? Number(((totalER * 9) / totalIP).toFixed(2)) : null;
+
+        return {
+          name: pitcherName,
+          startsAtVenue: allVenueStarts.length,
+          era: venueEra, wins, losses,
+          record: `${wins}-${losses}`,
+          totalK, totalIP: Number(totalIP.toFixed(1)),
+          seasons: `${seasons[seasons.length - 1]}-${seasons[0]}`,
+        };
+      } catch (e: any) {
+        return { name: pitcherName, startsAtVenue: 0, era: null, record: "Data unavailable" };
+      }
+    }
+
+    const [homePitcherStats, awayPitcherStats] = await Promise.all([
+      fetchPitcherVenueStats(homePitcherId, homePitcherName),
+      fetchPitcherVenueStats(awayPitcherId, awayPitcherName),
+    ]);
+
+    const result = {
+      team: homeTeam, venueOURecord, last5Games,
+      pitcherVenueStats: { home: homePitcherStats, away: awayPitcherStats },
+    };
+
+    venueStatsCache.set(cacheKey, { data: result, time: Date.now() });
+    res.json(result);
+
+  } catch (err: any) {
+    console.error("Venue stats error:", err.message);
+    res.status(500).json({ error: "Failed to fetch venue stats", details: err.message });
+  }
+});
+
 // ─── MAIN MLB GAMES ───────────────────────────────────────────
 async function fetchGames() {
   const today = new Date().toISOString().split("T")[0];
@@ -1007,7 +1103,6 @@ async function fetchGames() {
       const homeML = h2hMarket?.outcomes?.find((o: any) => o.name === homeTeam)?.price ?? null;
       const awayML = h2hMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.price ?? null;
 
-      // Fetch pitcher stats
       const pitchers = probablePitchers.get(homeTeam);
       let homePitcher: PitcherStats | null = null;
       let awayPitcher: PitcherStats | null = null;
@@ -1023,7 +1118,6 @@ async function fetchGames() {
         awayPitcherScore = calculatePitcherScore(awayPitcher);
       }
 
-      // Fetch team stats (offense + bullpen)
       const [homeStats, awayStats] = await Promise.all([
         fetchTeamStats(homeTeam),
         fetchTeamStats(awayTeam),
@@ -1050,8 +1144,6 @@ async function fetchGames() {
             const windSpeed = Math.round(wd.wind?.speed ?? 0);
             const windType = getWindType(windDeg, orientation);
             const rawTemp = Math.round(wd.main.temp);
-
-            // ── Day/Night temperature adjustment ──
             const adjustedTemp = adjustTempForGameTime(rawTemp, commenceTime);
 
             weather = {
@@ -1064,18 +1156,15 @@ async function fetchGames() {
               wind_deg: windDeg,
               wind_type: windType,
               condition: wd.weather?.[0]?.description ?? "unknown",
-              isFixedDome,
-              isRetractable,
+              isFixedDome, isRetractable,
             };
 
             if (total !== null) {
               edge = calculateEdge({
-                windSpeed, windType,
-                temp: adjustedTemp, // use adjusted temp
+                windSpeed, windType, temp: adjustedTemp,
                 humidity: wd.main.humidity,
                 total, isFixedDome, isRetractable,
-                homePitcherScore, awayPitcherScore,
-                parkFactor,
+                homePitcherScore, awayPitcherScore, parkFactor,
                 homeOffenseScore, awayOffenseScore,
                 homeBullpenScore, awayBullpenScore,
               });
@@ -1122,11 +1211,13 @@ async function fetchGames() {
         },
         pitchers: {
           home: homePitcher ? {
+            id: pitchers?.home?.id,
             name: homePitcher.name, era: homePitcher.era,
             fip: homePitcher.fip, kPer9: homePitcher.kPer9,
             hrPer9: homePitcher.hrPer9,
           } : null,
           away: awayPitcher ? {
+            id: pitchers?.away?.id,
             name: awayPitcher.name, era: awayPitcher.era,
             fip: awayPitcher.fip, kPer9: awayPitcher.kPer9,
             hrPer9: awayPitcher.hrPer9,
@@ -1136,7 +1227,7 @@ async function fetchGames() {
     })
   );
 
-  // ✅ Save ALL predictions once after processing
+  // ✅ Save ALL predictions once after all games processed
   if (newPredictionsAdded) await saveToRedis();
 
   return results;
