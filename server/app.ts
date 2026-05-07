@@ -84,6 +84,7 @@ async function saveToRedis() {
     const predictionsObj = Object.fromEntries(predictionStore);
     await redisSet("predictions", predictionsObj);
     await redisSet("season", { wins: seasonWins, losses: seasonLosses, pushes: seasonPushes });
+    console.log(`💾 Saved ${predictionStore.size} predictions to Redis`);
   } catch (e) {
     console.error("Failed to save to Redis:", e);
   }
@@ -154,8 +155,6 @@ async function settlePredictions() {
 }
 
 // ─── BALLPARK FACTORS (2026) ──────────────────────────────────
-// Source: Baseball Savant / FanGraphs park factors
-// 100 = league average, >100 = hitter friendly, <100 = pitcher friendly
 const PARK_FACTORS: Record<string, { runs: number; hr: number; name: string }> = {
   "Colorado Rockies":      { runs: 124, hr: 117, name: "Coors Field" },
   "Cincinnati Reds":       { runs: 108, hr: 113, name: "Great American Ball Park" },
@@ -187,6 +186,66 @@ const PARK_FACTORS: Record<string, { runs: number; hr: number; name: string }> =
   "Oakland Athletics":     { runs: 94,  hr: 93,  name: "Oakland Coliseum" },
   "San Francisco Giants":  { runs: 93,  hr: 88,  name: "Oracle Park" },
   "San Diego Padres":      { runs: 92,  hr: 89,  name: "Petco Park" },
+};
+
+// ─── NFL STADIUM DATA ─────────────────────────────────────────
+const NFL_FIXED_DOME_STADIUMS = new Set([
+  "Las Vegas Raiders", "Los Angeles Rams", "Los Angeles Chargers",
+  "Minnesota Vikings", "New Orleans Saints", "Indianapolis Colts",
+  "Detroit Lions", "Atlanta Falcons", "Houston Texans", "Arizona Cardinals",
+]);
+
+const NFL_RETRACTABLE_STADIUMS = new Set([
+  "Dallas Cowboys",
+]);
+
+const NFL_STADIUM_COORDS: Record<string, { lat: number; lon: number; name: string }> = {
+  "Arizona Cardinals":      { lat: 33.5276, lon: -112.2626, name: "State Farm Stadium" },
+  "Atlanta Falcons":        { lat: 33.7555, lon: -84.4009,  name: "Mercedes-Benz Stadium" },
+  "Baltimore Ravens":       { lat: 39.2780, lon: -76.6227,  name: "M&T Bank Stadium" },
+  "Buffalo Bills":          { lat: 42.7738, lon: -78.7870,  name: "Highmark Stadium" },
+  "Carolina Panthers":      { lat: 35.2258, lon: -80.8528,  name: "Bank of America Stadium" },
+  "Chicago Bears":          { lat: 41.8623, lon: -87.6167,  name: "Soldier Field" },
+  "Cincinnati Bengals":     { lat: 39.0955, lon: -84.5160,  name: "Paycor Stadium" },
+  "Cleveland Browns":       { lat: 41.5061, lon: -81.6995,  name: "Cleveland Browns Stadium" },
+  "Dallas Cowboys":         { lat: 32.7473, lon: -97.0945,  name: "AT&T Stadium" },
+  "Denver Broncos":         { lat: 39.7439, lon: -105.0201, name: "Empower Field" },
+  "Detroit Lions":          { lat: 42.3400, lon: -83.0456,  name: "Ford Field" },
+  "Green Bay Packers":      { lat: 44.5013, lon: -88.0622,  name: "Lambeau Field" },
+  "Houston Texans":         { lat: 29.6847, lon: -95.4107,  name: "NRG Stadium" },
+  "Indianapolis Colts":     { lat: 39.7601, lon: -86.1639,  name: "Lucas Oil Stadium" },
+  "Jacksonville Jaguars":   { lat: 30.3240, lon: -81.6373,  name: "EverBank Stadium" },
+  "Kansas City Chiefs":     { lat: 39.0489, lon: -94.4839,  name: "Arrowhead Stadium" },
+  "Las Vegas Raiders":      { lat: 36.0909, lon: -115.1833, name: "Allegiant Stadium" },
+  "Los Angeles Chargers":   { lat: 33.9534, lon: -118.3391, name: "SoFi Stadium" },
+  "Los Angeles Rams":       { lat: 33.9534, lon: -118.3391, name: "SoFi Stadium" },
+  "Miami Dolphins":         { lat: 25.9580, lon: -80.2389,  name: "Hard Rock Stadium" },
+  "Minnesota Vikings":      { lat: 44.9737, lon: -93.2575,  name: "U.S. Bank Stadium" },
+  "New England Patriots":   { lat: 42.0909, lon: -71.2643,  name: "Gillette Stadium" },
+  "New Orleans Saints":     { lat: 29.9511, lon: -90.0812,  name: "Caesars Superdome" },
+  "New York Giants":        { lat: 40.8135, lon: -74.0745,  name: "MetLife Stadium" },
+  "New York Jets":          { lat: 40.8135, lon: -74.0745,  name: "MetLife Stadium" },
+  "Philadelphia Eagles":    { lat: 39.9008, lon: -75.1675,  name: "Lincoln Financial Field" },
+  "Pittsburgh Steelers":    { lat: 40.4468, lon: -80.0158,  name: "Acrisure Stadium" },
+  "San Francisco 49ers":    { lat: 37.4033, lon: -121.9694, name: "Levi's Stadium" },
+  "Seattle Seahawks":       { lat: 47.5952, lon: -122.3316, name: "Lumen Field" },
+  "Tampa Bay Buccaneers":   { lat: 27.9759, lon: -82.5033,  name: "Raymond James Stadium" },
+  "Tennessee Titans":       { lat: 36.1665, lon: -86.7713,  name: "Nissan Stadium" },
+  "Washington Commanders":  { lat: 38.9076, lon: -76.8645,  name: "FedExField" },
+};
+
+const NFL_PARK_FACTORS: Record<string, number> = {
+  "Arizona Cardinals": 100, "Atlanta Falcons": 100, "Baltimore Ravens": 98,
+  "Buffalo Bills": 95, "Carolina Panthers": 99, "Chicago Bears": 96,
+  "Cincinnati Bengals": 98, "Cleveland Browns": 95, "Dallas Cowboys": 102,
+  "Denver Broncos": 98, "Detroit Lions": 100, "Green Bay Packers": 94,
+  "Houston Texans": 100, "Indianapolis Colts": 100, "Jacksonville Jaguars": 101,
+  "Kansas City Chiefs": 97, "Las Vegas Raiders": 100, "Los Angeles Chargers": 101,
+  "Los Angeles Rams": 101, "Miami Dolphins": 102, "Minnesota Vikings": 100,
+  "New England Patriots": 96, "New Orleans Saints": 100, "New York Giants": 97,
+  "New York Jets": 97, "Philadelphia Eagles": 97, "Pittsburgh Steelers": 97,
+  "San Francisco 49ers": 99, "Seattle Seahawks": 98, "Tampa Bay Buccaneers": 101,
+  "Tennessee Titans": 99, "Washington Commanders": 97,
 };
 
 // ─── PITCHER STATS ────────────────────────────────────────────
@@ -377,7 +436,6 @@ function calculateEdge({ windSpeed, windType, temp, humidity, total, isFixedDome
 }) {
   let score = 0;
 
-  // ── Weather (skip for fixed dome) ──
   if (!isFixedDome) {
     if (windType === "OUT") score += windSpeed * 1.5;
     if (windType === "IN") score -= windSpeed * 1.5;
@@ -394,13 +452,9 @@ function calculateEdge({ windSpeed, windType, temp, humidity, total, isFixedDome
     if (temp >= 85 && humidity < 50) score += 5;
   }
 
-  // ── Pitcher score ──
   const pitcherScore = (homePitcherScore + awayPitcherScore) / 2;
   score += pitcherScore;
 
-  // ── Park factor adjustment ──
-  // (parkFactor - 100) gives deviation from neutral
-  // Scaled to max ±6 points for extreme parks like Coors (+24) or Petco (-8)
   const parkDeviation = parkFactor - 100;
   const parkScore = parkDeviation * 0.25;
   score += parkScore;
@@ -425,6 +479,74 @@ function calculateEdge({ windSpeed, windType, temp, humidity, total, isFixedDome
     isRetractable,
     pitcherScore: Math.round(pitcherScore),
     parkScore: Math.round(parkScore),
+    parkFactor,
+  };
+}
+
+function calculateNFLEdge({ windSpeed, windType, temp, humidity, precipitation, total, isFixedDome, isRetractable, parkFactor }: {
+  windSpeed: number;
+  windType: "OUT" | "IN" | "CROSS";
+  temp: number;
+  humidity: number;
+  precipitation: number;
+  total: number;
+  isFixedDome: boolean;
+  isRetractable: boolean;
+  parkFactor: number;
+}) {
+  let score = 0;
+
+  if (!isFixedDome) {
+    if (windSpeed >= 20) score -= 12;
+    else if (windSpeed >= 15) score -= 8;
+    else if (windSpeed >= 10) score -= 4;
+    else if (windSpeed >= 7) score -= 2;
+
+    if (temp <= 20) score -= 12;
+    else if (temp <= 32) score -= 8;
+    else if (temp <= 40) score -= 5;
+    else if (temp <= 50) score -= 3;
+    else if (temp >= 85) score += 3;
+    else if (temp >= 75) score += 2;
+
+    if (precipitation >= 70) score -= 10;
+    else if (precipitation >= 50) score -= 6;
+    else if (precipitation >= 30) score -= 3;
+
+    if (windSpeed >= 15 && temp <= 32) score -= 6;
+  }
+
+  const parkDeviation = parkFactor - 100;
+  score += parkDeviation * 0.3;
+
+  const pointsAdded = score / 20 * 3;
+  const adjustedTotal = total + pointsAdded;
+
+  let play = "NO EDGE";
+  let confidence = "LOW";
+  if (score >= 20) { play = "OVER"; confidence = "HIGH"; }
+  else if (score >= 10) { play = "OVER"; confidence = "MEDIUM"; }
+  else if (score <= -20) { play = "UNDER"; confidence = "HIGH"; }
+  else if (score <= -10) { play = "UNDER"; confidence = "MEDIUM"; }
+
+  let spreadLean = "NEUTRAL";
+  if (!isFixedDome) {
+    if (windSpeed >= 15 || temp <= 32 || precipitation >= 50) {
+      spreadLean = "UNDER and home team defense";
+    } else if (temp >= 75 && windSpeed < 10) {
+      spreadLean = "OVER and offensive teams";
+    }
+  }
+
+  return {
+    score: Math.round(score),
+    play,
+    confidence,
+    pointsAdded: Number(pointsAdded.toFixed(1)),
+    adjustedTotal: Number(adjustedTotal.toFixed(1)),
+    spreadLean,
+    isFixedDome,
+    isRetractable,
     parkFactor,
   };
 }
@@ -496,7 +618,125 @@ app.get("/results", (req, res) => {
   });
 });
 
-// ─── NFL SCORES (ESPN API) ────────────────────────────────────
+// ─── NFL GAMES ENDPOINT ───────────────────────────────────────
+app.get("/nfl-games", async (req, res) => {
+  try {
+    const oddsRes = await fetch(
+      `https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=totals,spreads,h2h&oddsFormat=american`
+    );
+    if (!oddsRes.ok) throw new Error(`Odds API error: ${oddsRes.status}`);
+    const oddsData = await oddsRes.json() as any[];
+
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const upcomingGames = oddsData.filter((game: any) => {
+      const gameTime = new Date(game.commence_time);
+      return gameTime >= startOfToday;
+    });
+
+    const games = await Promise.all(
+      upcomingGames.map(async (game: any) => {
+        const homeTeam = game.home_team;
+        const awayTeam = game.away_team;
+        const commenceTime = game.commence_time;
+        const isFixedDome = NFL_FIXED_DOME_STADIUMS.has(homeTeam);
+        const isRetractable = NFL_RETRACTABLE_STADIUMS.has(homeTeam);
+        const parkFactor = NFL_PARK_FACTORS[homeTeam] ?? 100;
+
+        const bookmaker = game.bookmakers?.find((b: any) => b.key === 'draftkings')
+          ?? game.bookmakers?.find((b: any) => b.key === 'fanduel')
+          ?? game.bookmakers?.[0];
+
+        const totalsMarket = bookmaker?.markets?.find((m: any) => m.key === "totals");
+        const spreadsMarket = bookmaker?.markets?.find((m: any) => m.key === "spreads");
+        const h2hMarket = bookmaker?.markets?.find((m: any) => m.key === "h2h");
+
+        const overLine = totalsMarket?.outcomes?.find((o: any) => o.name === "Over");
+        const total = overLine?.point ?? null;
+        const homeSpread = spreadsMarket?.outcomes?.find((o: any) => o.name === homeTeam)?.point ?? null;
+        const awaySpread = spreadsMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.point ?? null;
+        const homeML = h2hMarket?.outcomes?.find((o: any) => o.name === homeTeam)?.price ?? null;
+        const awayML = h2hMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.price ?? null;
+
+        let weather = null;
+        let edge = null;
+        const stadium = NFL_STADIUM_COORDS[homeTeam];
+
+        if (stadium && WEATHER_API_KEY) {
+          try {
+            const weatherRes = await fetch(
+              `https://api.openweathermap.org/data/2.5/weather?lat=${stadium.lat}&lon=${stadium.lon}&appid=${WEATHER_API_KEY}&units=imperial`
+            );
+            if (weatherRes.ok) {
+              const wd = await weatherRes.json() as any;
+              const windDeg = wd.wind?.deg ?? 0;
+              const windSpeed = Math.round(wd.wind?.speed ?? 0);
+              const windType = getWindType(windDeg, 180);
+              const precipitation = wd.pop ? Math.round(wd.pop * 100) : 0;
+
+              weather = {
+                stadium: stadium.name,
+                temp_f: Math.round(wd.main.temp),
+                feels_like_f: Math.round(wd.main.feels_like),
+                humidity: wd.main.humidity,
+                wind_mph: windSpeed,
+                wind_deg: windDeg,
+                condition: wd.weather?.[0]?.description ?? "unknown",
+                precipitation_pct: precipitation,
+                isFixedDome,
+                isRetractable,
+              };
+
+              if (total !== null) {
+                edge = calculateNFLEdge({
+                  windSpeed,
+                  windType,
+                  temp: Math.round(wd.main.temp),
+                  humidity: wd.main.humidity,
+                  precipitation,
+                  total,
+                  isFixedDome,
+                  isRetractable,
+                  parkFactor,
+                });
+              }
+            }
+          } catch (e) {}
+        }
+
+        return {
+          id: game.id,
+          sport: "NFL",
+          home_team: homeTeam,
+          away_team: awayTeam,
+          commence_time: commenceTime,
+          bookmaker: bookmaker?.title ?? "Unknown",
+          total,
+          home_spread: homeSpread,
+          away_spread: awaySpread,
+          home_ml: homeML,
+          away_ml: awayML,
+          weather,
+          edge,
+          park: {
+            factor: parkFactor,
+            name: stadium?.name ?? "Unknown",
+            isFixedDome,
+            isRetractable,
+          },
+        };
+      })
+    );
+
+    res.json(games);
+  } catch (err: any) {
+    console.error("NFL games error:", err.message);
+    res.status(500).json({ error: "Failed to fetch NFL games", details: err.message });
+  }
+});
+
+// ─── NFL SCORES (ESPN) ────────────────────────────────────────
 app.get("/nfl-scores", async (req, res) => {
   try {
     const espnRes = await fetch(
@@ -531,12 +771,11 @@ app.get("/nfl-scores", async (req, res) => {
 
     res.json({ success: true, week: data.week?.number, season: data.season?.year, games });
   } catch (err: any) {
-    console.error("NFL scores error:", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ─── MLB SCORES (for PoolZone 13-run pool) ───────────────────
+// ─── MLB SCORES (PoolZone) ────────────────────────────────────
 interface MLBGame {
   gameId: number;
   date: string;
@@ -603,8 +842,7 @@ app.get("/poolzone/mlb-scores/range", async (req, res) => {
         const isFinal = status.toLowerCase().includes("final");
         if (isFinal) {
           games.push({
-            gameId: game.gamePk,
-            date: dateObj.date,
+            gameId: game.gamePk, date: dateObj.date,
             homeTeam: game.teams?.home?.team?.name || "",
             awayTeam: game.teams?.away?.team?.name || "",
             homeScore: game.teams?.home?.score ?? 0,
@@ -620,6 +858,7 @@ app.get("/poolzone/mlb-scores/range", async (req, res) => {
   }
 });
 
+// ─── MAIN FETCH GAMES (MLB BallparkEdge) ──────────────────────
 async function fetchGames() {
   const today = new Date().toISOString().split("T")[0];
   const probablePitchers = await fetchProbablePitchers(today);
@@ -638,6 +877,8 @@ async function fetchGames() {
     return gameTime >= startOfToday;
   });
 
+  let newPredictionsAdded = false;
+
   const results = await Promise.all(
     todayGames.map(async (game: any) => {
       const homeTeam = game.home_team;
@@ -645,8 +886,6 @@ async function fetchGames() {
       const commenceTime = game.commence_time;
       const isFixedDome = FIXED_DOME_STADIUMS.has(homeTeam);
       const isRetractable = RETRACTABLE_ROOF_STADIUMS.has(homeTeam);
-
-      // Get park factor for home team
       const parkData = PARK_FACTORS[homeTeam] ?? { runs: 100, hr: 100, name: "Unknown" };
       const parkFactor = parkData.runs;
 
@@ -714,32 +953,23 @@ async function fetchGames() {
 
             if (total !== null) {
               edge = calculateEdge({
-                windSpeed,
-                windType,
+                windSpeed, windType,
                 temp: Math.round(wd.main.temp),
                 humidity: wd.main.humidity,
-                total,
-                isFixedDome,
-                isRetractable,
-                homePitcherScore,
-                awayPitcherScore,
-                parkFactor,
+                total, isFixedDome, isRetractable,
+                homePitcherScore, awayPitcherScore, parkFactor,
               });
 
+              // Store prediction — NO saveToRedis here
               const gameId = `${today}_${homeTeam.replace(/\s+/g, '_')}`;
               if (!predictionStore.has(gameId) && edge.play !== "NO EDGE") {
                 predictionStore.set(gameId, {
-                  gameId,
-                  date: today,
-                  homeTeam,
-                  awayTeam,
-                  predictedPlay: edge.play,
-                  total,
-                  confidence: edge.confidence,
-                  settled: false,
+                  gameId, date: today, homeTeam, awayTeam,
+                  predictedPlay: edge.play, total,
+                  confidence: edge.confidence, settled: false,
                 });
+                newPredictionsAdded = true;
                 console.log(`📝 Stored prediction: ${awayTeam} @ ${homeTeam} — ${edge.play} ${total}`);
-                await saveToRedis();
               }
             }
           }
@@ -752,11 +982,8 @@ async function fetchGames() {
         away_team: awayTeam,
         commence_time: commenceTime,
         bookmaker: bookmaker?.title ?? "Unknown",
-        total,
-        home_ml: homeML,
-        away_ml: awayML,
-        weather,
-        edge,
+        total, home_ml: homeML, away_ml: awayML,
+        weather, edge,
         park: {
           factor: parkFactor,
           hrFactor: parkData.hr,
@@ -766,25 +993,24 @@ async function fetchGames() {
         },
         pitchers: {
           home: homePitcher ? {
-            name: homePitcher.name,
-            era: homePitcher.era,
-            fip: homePitcher.fip,
-            kPer9: homePitcher.kPer9,
-            hrPer9: homePitcher.hrPer9,
-            flyBallRate: homePitcher.flyBallRate,
+            name: homePitcher.name, era: homePitcher.era,
+            fip: homePitcher.fip, kPer9: homePitcher.kPer9,
+            hrPer9: homePitcher.hrPer9, flyBallRate: homePitcher.flyBallRate,
           } : null,
           away: awayPitcher ? {
-            name: awayPitcher.name,
-            era: awayPitcher.era,
-            fip: awayPitcher.fip,
-            kPer9: awayPitcher.kPer9,
-            hrPer9: awayPitcher.hrPer9,
-            flyBallRate: awayPitcher.flyBallRate,
+            name: awayPitcher.name, era: awayPitcher.era,
+            fip: awayPitcher.fip, kPer9: awayPitcher.kPer9,
+            hrPer9: awayPitcher.hrPer9, flyBallRate: awayPitcher.flyBallRate,
           } : null,
         },
       };
     })
   );
+
+  // ✅ Save ALL predictions to Redis ONCE after all games processed
+  if (newPredictionsAdded) {
+    await saveToRedis();
+  }
 
   return results;
 }
@@ -842,184 +1068,7 @@ async function startup() {
   setInterval(refreshCache, 30 * 60 * 1000);
   scheduleSettlement();
 }
-// ═══════════════════════════════════════════════════════════════
-// POOLZONE AUTO-SYNC — Firebase Admin + Cron Jobs
-// ═══════════════════════════════════════════════════════════════
-import * as admin from 'firebase-admin';
-import * as cron from 'node-cron';
 
-// Initialize Firebase Admin
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-}
-const db = admin.firestore();
-
-// ── Fetch all leagues from Firestore ──
-async function getAllLeagues() {
-  const snap = await db.collection('leagues').get();
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-}
-
-// ── Auto-sync MLB scores into all 13-Run pools ──
-async function autoSyncMLBScores() {
-  console.log('[PoolZone] Running MLB auto-sync...');
-  try {
-    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
-    const url = `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${today}&hydrate=linescore`;
-    const res = await fetch(url);
-    const data = await res.json() as any;
-
-    const finalGames: { homeTeam: string; awayTeam: string; homeScore: number; awayScore: number }[] = [];
-    for (const dateObj of (data.dates || [])) {
-      for (const game of (dateObj.games || [])) {
-        const status = game.status?.detailedState || '';
-        if (status.toLowerCase().includes('final')) {
-          finalGames.push({
-            homeTeam: game.teams?.home?.team?.name || '',
-            awayTeam: game.teams?.away?.team?.name || '',
-            homeScore: game.teams?.home?.score ?? 0,
-            awayScore: game.teams?.away?.score ?? 0,
-          });
-        }
-      }
-    }
-
-    if (!finalGames.length) {
-      console.log('[PoolZone] No final MLB games today.');
-      return;
-    }
-
-    const leagues = await getAllLeagues();
-    let totalUpdates = 0;
-
-    for (const league of leagues) {
-      const thirteen = (league as any).thirteen || {};
-      const assignments = thirteen.assignments || [];
-      if (!assignments.length || !thirteen.drawn) continue;
-
-      let changed = false;
-      for (const game of finalGames) {
-        const teams = [
-          { name: game.homeTeam, score: game.homeScore },
-          { name: game.awayTeam, score: game.awayScore },
-        ];
-        for (const t of teams) {
-          const player = assignments.find((a: any) => a.team === t.name && !a.benched);
-          if (!player) continue;
-          if (t.score >= 0 && t.score <= 13) {
-            player.hits = player.hits || {};
-            player.hits[t.score] = (player.hits[t.score] || 0) + 1;
-            changed = true;
-            totalUpdates++;
-          }
-        }
-      }
-
-      if (changed) {
-        await db.collection('leagues').doc(league.id).update({
-          'thirteen.assignments': assignments,
-        });
-        console.log(`[PoolZone] Updated league ${league.id}`);
-      }
-    }
-
-    console.log(`[PoolZone] MLB sync complete. ${totalUpdates} scores updated across ${leagues.length} leagues.`);
-  } catch (e) {
-    console.error('[PoolZone] MLB sync error:', e);
-  }
-}
-
-// ── Auto-sync NFL results into all Survivor pools ──
-async function autoSyncNFLResults() {
-  console.log('[PoolZone] Running NFL auto-sync...');
-  try {
-    const NFL_API_KEY = process.env.NFL_API_KEY;
-    if (!NFL_API_KEY) { console.warn('[PoolZone] NFL_API_KEY not set'); return; }
-
-    const now = new Date();
-    const season = now.getFullYear();
-    const seasonStart = new Date(season, 8, 5);
-    const weekNum = Math.max(1, Math.ceil((now.getTime() - seasonStart.getTime()) / (7 * 24 * 60 * 60 * 1000)));
-    const week = Math.min(weekNum, 18);
-
-    const url = `https://v1.american-football.api-sports.io/games?league=1&season=${season}&week=${week}`;
-    const apiRes = await fetch(url, {
-      headers: {
-        'x-rapidapi-key': NFL_API_KEY,
-        'x-rapidapi-host': 'v1.american-football.api-sports.io',
-      },
-    });
-    const data = await apiRes.json() as any;
-
-    const results: Record<string, boolean> = {};
-    for (const game of (data.response || [])) {
-      if (game.game?.status?.short !== 'FT') continue;
-      const homeScore = game.scores?.home?.total ?? 0;
-      const awayScore = game.scores?.away?.total ?? 0;
-      results[game.teams?.home?.name || ''] = homeScore > awayScore;
-      results[game.teams?.away?.name || ''] = awayScore > homeScore;
-    }
-
-    if (!Object.keys(results).length) {
-      console.log('[PoolZone] No final NFL games found.');
-      return;
-    }
-
-    const leagues = await getAllLeagues();
-    for (const league of leagues) {
-      const survivor = (league as any).survivor || {};
-      const players = survivor.players || [];
-      const currentWeek = survivor.currentWeek || 1;
-      if (!players.length) continue;
-
-      let changed = false;
-      for (const player of players) {
-        const pick = player.picks?.[currentWeek];
-        if (!pick?.team || !player.alive) continue;
-        const won = Object.entries(results).find(([team]) =>
-          team.toLowerCase().includes(pick.team.toLowerCase()) ||
-          pick.team.toLowerCase().includes(team.toLowerCase())
-        );
-        if (won !== undefined) {
-          pick.result = won[1] ? 'W' : 'L';
-          changed = true;
-        }
-      }
-
-      if (changed) {
-        await db.collection('leagues').doc(league.id).update({
-          'survivor.players': players,
-        });
-        console.log(`[PoolZone] Updated survivor league ${league.id}`);
-      }
-    }
-    console.log('[PoolZone] NFL sync complete.');
-  } catch (e) {
-    console.error('[PoolZone] NFL sync error:', e);
-  }
-}
-
-// ── Cron Jobs ──
-// MLB: Once daily at 4am Eastern (9am UTC)
-cron.schedule('0 9 * * *', () => {
-  autoSyncMLBScores();
-});
-
-// NFL: Every Monday at 2am Eastern (7am UTC) during NFL season (Sep-Feb)
-cron.schedule('0 7 * * 1', () => {
-  const month = new Date().getMonth();
-  if (month >= 8 || month <= 1) { // Sep(8) through Feb(1)
-    autoSyncNFLResults();
-  }
-});
-
-console.log('[PoolZone] Auto-sync cron jobs scheduled ✓');
-// ═══════════════════════════════════════════════════════════════
-// END POOLZONE AUTO-SYNC
-// ═══════════════════════════════════════════════════════════════
 startup();
 
 export default app;
