@@ -1003,8 +1003,8 @@ async function autoSyncNFLResults() {
 }
 
 // ── Cron Jobs ──
-// MLB: Every hour 6pm-midnight Eastern (11pm-5am UTC)
-cron.schedule('0 23,0,1,2,3,4,5 * * *', () => {
+// MLB: Once daily at 4am Eastern (9am UTC)
+cron.schedule('0 9 * * *', () => {
   autoSyncMLBScores();
 });
 
