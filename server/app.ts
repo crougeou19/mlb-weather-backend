@@ -953,7 +953,7 @@ app.get("/venue-stats", async (req, res) => {
     const currentYear = new Date().getFullYear();
     const seasons = [currentYear, currentYear - 1, currentYear - 2];
 
-    // Fetch home games across 3 seasons
+    // Fetch home games across 3 seasons for O/U record + last 5
     let allGames: any[] = [];
     for (const season of seasons) {
       try {
@@ -999,19 +999,40 @@ app.get("/venue-stats", async (req, res) => {
       seasons: `${seasons[seasons.length - 1]}-${seasons[0]}`,
     };
 
-    // Pitcher venue history
-    async function fetchPitcherVenueStats(pitcherId: string, pitcherName: string) {
+    // ── Pitcher venue history ──
+    // Home pitcher: current season home starts only (home always = their park)
+    // Away pitcher: all 3 seasons vs this opponent
+    async function fetchPitcherVenueStats(
+      pitcherId: string,
+      pitcherName: string,
+      isHomePitcher: boolean
+    ) {
       if (!pitcherId) return null;
       try {
         const allVenueStarts: any[] = [];
-        for (const season of seasons) {
+        const seasonsToCheck = isHomePitcher ? [currentYear] : seasons;
+
+        for (const season of seasonsToCheck) {
           try {
-            const vRes = await fetch(
-              `https://statsapi.mlb.com/api/v1/people/${pitcherId}/stats?stats=gameLog&group=pitching&season=${season}&opposingTeamId=${teamId}`
+            const logRes = await fetch(
+              `https://statsapi.mlb.com/api/v1/people/${pitcherId}/stats?stats=gameLog&group=pitching&season=${season}`
             );
-            const vData = await vRes.json() as any;
-            const vSplits = vData?.stats?.[0]?.splits || [];
-            allVenueStarts.push(...vSplits.map((s: any) => ({ ...s, season })));
+            const logData = await logRes.json() as any;
+            const splits = logData?.stats?.[0]?.splits || [];
+
+            for (const split of splits) {
+              if (isHomePitcher) {
+                // Home pitcher — only count home starts (always at their park)
+                if (split.isHome === true) {
+                  allVenueStarts.push({ ...split, season });
+                }
+              } else {
+                // Away pitcher — only count starts against this specific team
+                if (split.opponent?.id === teamId) {
+                  allVenueStarts.push({ ...split, season });
+                }
+              }
+            }
           } catch (e) {}
         }
 
@@ -1020,20 +1041,33 @@ app.get("/venue-stats", async (req, res) => {
           era: null, record: "No starts at this venue",
         };
 
-        const totalIP = allVenueStarts.reduce((sum: number, s: any) => sum + parseFloat(s.stat?.inningsPitched ?? "0"), 0);
-        const totalER = allVenueStarts.reduce((sum: number, s: any) => sum + parseInt(s.stat?.earnedRuns ?? "0"), 0);
+        const totalIP = allVenueStarts.reduce((sum: number, s: any) =>
+          sum + parseFloat(s.stat?.inningsPitched ?? "0"), 0);
+        const totalER = allVenueStarts.reduce((sum: number, s: any) =>
+          sum + parseInt(s.stat?.earnedRuns ?? "0"), 0);
         const wins = allVenueStarts.filter((s: any) => s.stat?.wins === 1).length;
         const losses = allVenueStarts.filter((s: any) => s.stat?.losses === 1).length;
-        const totalK = allVenueStarts.reduce((sum: number, s: any) => sum + parseInt(s.stat?.strikeOuts ?? "0"), 0);
+        const totalK = allVenueStarts.reduce((sum: number, s: any) =>
+          sum + parseInt(s.stat?.strikeOuts ?? "0"), 0);
+        const totalHits = allVenueStarts.reduce((sum: number, s: any) =>
+          sum + parseInt(s.stat?.hits ?? "0"), 0);
+        const totalBB = allVenueStarts.reduce((sum: number, s: any) =>
+          sum + parseInt(s.stat?.baseOnBalls ?? "0"), 0);
         const venueEra = totalIP > 0 ? Number(((totalER * 9) / totalIP).toFixed(2)) : null;
+        const whip = totalIP > 0 ? Number(((totalHits + totalBB) / totalIP).toFixed(2)) : null;
 
         return {
           name: pitcherName,
           startsAtVenue: allVenueStarts.length,
-          era: venueEra, wins, losses,
+          era: venueEra,
+          whip,
+          wins, losses,
           record: `${wins}-${losses}`,
-          totalK, totalIP: Number(totalIP.toFixed(1)),
-          seasons: `${seasons[seasons.length - 1]}-${seasons[0]}`,
+          totalK,
+          totalIP: Number(totalIP.toFixed(1)),
+          seasonsLabel: isHomePitcher
+            ? `${currentYear} season`
+            : `${seasons[seasons.length - 1]}-${seasons[0]}`,
         };
       } catch (e: any) {
         return { name: pitcherName, startsAtVenue: 0, era: null, record: "Data unavailable" };
@@ -1041,8 +1075,8 @@ app.get("/venue-stats", async (req, res) => {
     }
 
     const [homePitcherStats, awayPitcherStats] = await Promise.all([
-      fetchPitcherVenueStats(homePitcherId, homePitcherName),
-      fetchPitcherVenueStats(awayPitcherId, awayPitcherName),
+      fetchPitcherVenueStats(homePitcherId, homePitcherName, true),
+      fetchPitcherVenueStats(awayPitcherId, awayPitcherName, false),
     ]);
 
     const result = {
