@@ -1514,9 +1514,10 @@ cron.schedule('0 9 * * *', () => { autoSyncMLBScores(); });
 cron.schedule('0 7 * * 1', () => {
   const month = new Date().getMonth();
   if (month >= 8 || month <= 1) {
-    const season = new Date().getFullYear();
-    const seasonStart = new Date(season, 8, 5);
-    const week = M
+    autoSyncNFLScores();
+  }
+});
+
 startup();
 
 export default app;
