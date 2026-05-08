@@ -742,7 +742,13 @@ app.get("/nfl-games", async (req, res) => {
 
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
-    const upcomingGames = oddsData.filter((game: any) => new Date(game.commence_time) >= startOfToday);
+    const endOfToday = new Date();
+    endOfToday.setHours(23, 59, 59, 999);
+
+    const upcomingGames = oddsData.filter((game: any) => {
+      const gameTime = new Date(game.commence_time);
+      return gameTime >= startOfToday && gameTime <= endOfToday;
+    });
 
     const games = await Promise.all(upcomingGames.map(async (game: any) => {
       const homeTeam = game.home_team;
@@ -1093,9 +1099,18 @@ async function fetchGames() {
   if (!oddsRes.ok) throw new Error(`Odds API error: ${oddsRes.status}`);
   const oddsData = await oddsRes.json() as any[];
 
+  // ✅ Only today's games — not tomorrow or future games
   const startOfToday = new Date();
   startOfToday.setHours(0, 0, 0, 0);
-  const todayGames = oddsData.filter((game: any) => new Date(game.commence_time) >= startOfToday);
+  const endOfToday = new Date();
+  endOfToday.setHours(23, 59, 59, 999);
+
+  const todayGames = oddsData.filter((game: any) => {
+    const gameTime = new Date(game.commence_time);
+    return gameTime >= startOfToday && gameTime <= endOfToday;
+  });
+
+  console.log(`Found ${todayGames.length} games for today`);
 
   let newPredictionsAdded = false;
 
