@@ -550,6 +550,15 @@ function adjustTempForGameTime(temp: number, commenceTime: string): number {
   }
 }
 
+// ─── EASTERN TIME DATE HELPERS ────────────────────────────────
+function getTodayET(): { start: Date; end: Date; dateStr: string } {
+  const nowET = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  // EDT is UTC-4, EST is UTC-5 — use -04:00 for summer (MLB season)
+  const start = new Date(`${nowET}T00:00:00-04:00`);
+  const end = new Date(`${nowET}T23:59:59-04:00`);
+  return { start, end, dateStr: nowET };
+}
+
 function calculateEdge({
   windSpeed, windType, temp, humidity, total,
   isFixedDome, isRetractable,
@@ -584,13 +593,10 @@ function calculateEdge({
 
   const pitcherScore = (homePitcherScore + awayPitcherScore) / 2;
   score += pitcherScore;
-
   const bullpenScore = (homeBullpenScore + awayBullpenScore) / 2;
   score += bullpenScore;
-
   const offenseScore = (homeOffenseScore + awayOffenseScore) / 2;
   score += offenseScore;
-
   const parkScore = (parkFactor - 100) * 0.25;
   score += parkScore;
 
@@ -647,7 +653,6 @@ function calculateNFLEdge({ windSpeed, windType, temp, humidity, precipitation, 
   }
 
   score += (parkFactor - 100) * 0.3;
-
   const pointsAdded = score / 20 * 3;
   const adjustedTotal = total + pointsAdded;
 
@@ -740,14 +745,10 @@ app.get("/nfl-games", async (req, res) => {
     if (!oddsRes.ok) throw new Error(`Odds API error: ${oddsRes.status}`);
     const oddsData = await oddsRes.json() as any[];
 
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const endOfToday = new Date();
-    endOfToday.setHours(23, 59, 59, 999);
-
+    const { start, end } = getTodayET();
     const upcomingGames = oddsData.filter((game: any) => {
       const gameTime = new Date(game.commence_time);
-      return gameTime >= startOfToday && gameTime <= endOfToday;
+      return gameTime >= start && gameTime <= end;
     });
 
     const games = await Promise.all(upcomingGames.map(async (game: any) => {
@@ -1024,13 +1025,9 @@ app.get("/venue-stats", async (req, res) => {
 
             for (const split of splits) {
               if (isHomePitcher) {
-                if (split.isHome === true) {
-                  allVenueStarts.push({ ...split, season });
-                }
+                if (split.isHome === true) allVenueStarts.push({ ...split, season });
               } else {
-                if (split.opponent?.id === teamId) {
-                  allVenueStarts.push({ ...split, season });
-                }
+                if (split.opponent?.id === teamId) allVenueStarts.push({ ...split, season });
               }
             }
           } catch (e) {}
@@ -1090,7 +1087,8 @@ app.get("/venue-stats", async (req, res) => {
 
 // ─── MAIN MLB GAMES ───────────────────────────────────────────
 async function fetchGames() {
-  const today = new Date().toISOString().split("T")[0];
+  const { start, end, dateStr: today } = getTodayET();
+
   const probablePitchers = await fetchProbablePitchers(today);
 
   const oddsRes = await fetch(
@@ -1099,18 +1097,13 @@ async function fetchGames() {
   if (!oddsRes.ok) throw new Error(`Odds API error: ${oddsRes.status}`);
   const oddsData = await oddsRes.json() as any[];
 
-  // ✅ Only today's games — not tomorrow or future games
-  const startOfToday = new Date();
-  startOfToday.setHours(0, 0, 0, 0);
-  const endOfToday = new Date();
-  endOfToday.setHours(23, 59, 59, 999);
-
+  // ✅ Filter to today ET only — captures late West Coast games correctly
   const todayGames = oddsData.filter((game: any) => {
     const gameTime = new Date(game.commence_time);
-    return gameTime >= startOfToday && gameTime <= endOfToday;
+    return gameTime >= start && gameTime <= end;
   });
 
-  console.log(`Found ${todayGames.length} games for today`);
+  console.log(`Found ${todayGames.length} games for today (${today} ET)`);
 
   let newPredictionsAdded = false;
 
