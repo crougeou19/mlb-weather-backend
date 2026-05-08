@@ -953,7 +953,6 @@ app.get("/venue-stats", async (req, res) => {
     const currentYear = new Date().getFullYear();
     const seasons = [currentYear, currentYear - 1, currentYear - 2];
 
-    // Fetch home games across 3 seasons for O/U record + last 5
     let allGames: any[] = [];
     for (const season of seasons) {
       try {
@@ -999,9 +998,6 @@ app.get("/venue-stats", async (req, res) => {
       seasons: `${seasons[seasons.length - 1]}-${seasons[0]}`,
     };
 
-    // ── Pitcher venue history ──
-    // Home pitcher: current season home starts only (home always = their park)
-    // Away pitcher: all 3 seasons vs this opponent
     async function fetchPitcherVenueStats(
       pitcherId: string,
       pitcherName: string,
@@ -1022,12 +1018,10 @@ app.get("/venue-stats", async (req, res) => {
 
             for (const split of splits) {
               if (isHomePitcher) {
-                // Home pitcher — only count home starts (always at their park)
                 if (split.isHome === true) {
                   allVenueStarts.push({ ...split, season });
                 }
               } else {
-                // Away pitcher — only count starts against this specific team
                 if (split.opponent?.id === teamId) {
                   allVenueStarts.push({ ...split, season });
                 }
@@ -1059,15 +1053,10 @@ app.get("/venue-stats", async (req, res) => {
         return {
           name: pitcherName,
           startsAtVenue: allVenueStarts.length,
-          era: venueEra,
-          whip,
-          wins, losses,
+          era: venueEra, whip, wins, losses,
           record: `${wins}-${losses}`,
-          totalK,
-          totalIP: Number(totalIP.toFixed(1)),
-          seasonsLabel: isHomePitcher
-            ? `${currentYear} season`
-            : `${seasons[seasons.length - 1]}-${seasons[0]}`,
+          totalK, totalIP: Number(totalIP.toFixed(1)),
+          seasonsLabel: isHomePitcher ? `${currentYear} season` : `${seasons[seasons.length - 1]}-${seasons[0]}`,
         };
       } catch (e: any) {
         return { name: pitcherName, startsAtVenue: 0, era: null, record: "Data unavailable" };
@@ -1261,9 +1250,7 @@ async function fetchGames() {
     })
   );
 
-  // ✅ Save ALL predictions once after all games processed
   if (newPredictionsAdded) await saveToRedis();
-
   return results;
 }
 
@@ -1320,169 +1307,6 @@ async function startup() {
   setInterval(refreshCache, 30 * 60 * 1000);
   scheduleSettlement();
 }
-// ═══════════════════════════════════════════════════════════════
-// POOLZONE ENDPOINTS — MLB + NFL scores
-// ═══════════════════════════════════════════════════════════════
-import * as admin from 'firebase-admin';
-import * as cron from 'node-cron';
-
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
-if (!admin.apps.length) {
-  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-}
-const fsdb = admin.firestore();
-
-interface MLBGame {
-  gameId: number; date: string;
-  homeTeam: string; awayTeam: string;
-  homeScore: number; awayScore: number;
-  status: string;
-}
-
-app.get("/poolzone/mlb-scores", async (req, res) => {
-  try {
-    const games = await fetchMLBScores(req.query.date as string | undefined);
-    res.json({ success: true, date: req.query.date || "today", games });
-  } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
-});
-
-app.get("/poolzone/mlb-scores/range", async (req, res) => {
-  try {
-    const { from, to } = req.query as { from: string; to: string };
-    if (!from || !to) return res.status(400).json({ success: false, error: "from and to required" });
-    const data = await (await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=${from}&endDate=${to}&hydrate=linescore`)).json() as any;
-    const games: MLBGame[] = [];
-    for (const dateObj of (data.dates || [])) {
-      for (const game of (dateObj.games || [])) {
-        if (game.status?.detailedState?.toLowerCase().includes("final")) {
-          games.push({
-            gameId: game.gamePk, date: dateObj.date,
-            homeTeam: game.teams?.home?.team?.name || "",
-            awayTeam: game.teams?.away?.team?.name || "",
-            homeScore: game.teams?.home?.score ?? 0,
-            awayScore: game.teams?.away?.score ?? 0,
-            status: "Final",
-          });
-        }
-      }
-    }
-    res.json({ success: true, from, to, games });
-  } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
-});
-
-interface NFLGame {
-  gameId: number; week: number; season: number;
-  homeTeam: string; awayTeam: string;
-  homeScore: number; awayScore: number;
-  homeWon: boolean; awayWon: boolean; status: string;
-}
-
-let cachedNFLGames: NFLGame[] | null = null;
-let nflCacheTime: number = 0;
-const NFL_CACHE_MS = 60 * 60 * 1000;
-
-async function fetchNFLWeek(week: number, season: number): Promise<NFLGame[]> {
-  const now = Date.now();
-  if (cachedNFLGames && now - nflCacheTime < NFL_CACHE_MS) return cachedNFLGames;
-  const NFL_API_KEY = process.env.NFL_API_KEY;
-  if (!NFL_API_KEY) throw new Error("NFL_API_KEY not set");
-  const data = await (await fetch(
-    `https://v1.american-football.api-sports.io/games?league=1&season=${season}&week=${week}`,
-    { headers: { "x-rapidapi-key": NFL_API_KEY, "x-rapidapi-host": "v1.american-football.api-sports.io" } }
-  )).json() as any;
-  const games: NFLGame[] = [];
-  for (const game of (data.response || [])) {
-    const isFinal = game.game?.status?.short === "FT";
-    const homeScore = game.scores?.home?.total ?? 0;
-    const awayScore = game.scores?.away?.total ?? 0;
-    games.push({
-      gameId: game.game?.id, week, season,
-      homeTeam: game.teams?.home?.name || "",
-      awayTeam: game.teams?.away?.name || "",
-      homeScore, awayScore,
-      homeWon: isFinal && homeScore > awayScore,
-      awayWon: isFinal && awayScore > homeScore,
-      status: isFinal ? "Final" : game.game?.status?.long || "Scheduled",
-    });
-  }
-  cachedNFLGames = games; nflCacheTime = now;
-  return games;
-}
-
-app.get("/poolzone/nfl-results", async (req, res) => {
-  try {
-    const week = parseInt(req.query.week as string) || 1;
-    const season = parseInt(req.query.season as string) || new Date().getFullYear();
-    const games = await fetchNFLWeek(week, season);
-    const results: Record<string, boolean> = {};
-    for (const g of games) {
-      if (g.status === "Final") { results[g.homeTeam] = g.homeWon; results[g.awayTeam] = g.awayWon; }
-    }
-    res.json({ success: true, week, season, games, results });
-  } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
-});
-
-async function getAllLeagues() {
-  const snap = await fsdb.collection('leagues').get();
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-}
-
-async function autoSyncMLBScores() {
-  console.log('[PoolZone] Running MLB auto-sync...');
-  try {
-    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
-    const data = await (await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${today}&hydrate=linescore`)).json() as any;
-    const finalGames: { gameId: number; homeTeam: string; awayTeam: string; homeScore: number; awayScore: number }[] = [];
-    for (const dateObj of (data.dates || [])) {
-      for (const game of (dateObj.games || [])) {
-        if (game.status?.detailedState?.toLowerCase().includes('final')) {
-          finalGames.push({
-            gameId: game.gamePk,
-            homeTeam: game.teams?.home?.team?.name || '',
-            awayTeam: game.teams?.away?.team?.name || '',
-            homeScore: game.teams?.home?.score ?? 0,
-            awayScore: game.teams?.away?.score ?? 0,
-          });
-        }
-      }
-    }
-    if (!finalGames.length) { console.log('[PoolZone] No final MLB games today.'); return; }
-    const leagues = await getAllLeagues();
-    let totalUpdates = 0;
-    for (const league of leagues) {
-      const thirteen = (league as any).thirteen || {};
-      const assignments = thirteen.assignments || [];
-      if (!assignments.length || !thirteen.drawn) continue;
-      let changed = false;
-      for (const game of finalGames) {
-        for (const t of [{ name: game.homeTeam, score: game.homeScore }, { name: game.awayTeam, score: game.awayScore }]) {
-          const player = assignments.find((a: any) => a.team === t.name && !a.benched);
-          if (!player) continue;
-          if (t.score >= 0 && t.score <= 13) {
-            player.hits = player.hits || {};
-            player.hitDates = player.hitDates || {};
-            const wasZero = !player.hits[t.score];
-            player.hits[t.score] = (player.hits[t.score] || 0) + 1;
-            if (wasZero) player.hitDates[t.score] = Date.now();
-            changed = true;
-            totalUpdates++;
-          }
-        }
-      }
-      if (changed) {
-        await fsdb.collection('leagues').doc(league.id).update({ 'thirteen.assignments': assignments });
-        console.log(`[PoolZone] Updated league ${league.id}`);
-      }
-    }
-    console.log(`[PoolZone] MLB sync complete. ${totalUpdates} scores updated.`);
-  } catch (e) { console.error('[PoolZone] MLB sync error:', e); }
-}
-
-// MLB: Once daily at 4am Eastern (9am UTC)
-cron.schedule('0 9 * * *', () => { autoSyncMLBScores(); });
-
-// NFL: Every Monday at 2am Eastern (7am UTC) Sep-Feb only - not yet implemented
-// cron.schedule('0 7 * * 1', () => { autoSyncNFLScores(); });
 
 startup();
 
