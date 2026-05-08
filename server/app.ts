@@ -1339,35 +1339,6 @@ interface MLBGame {
   status: string;
 }
 
-let cachedMLBScores: MLBGame[] | null = null;
-let mlbCacheTime: number = 0;
-const MLB_CACHE_MS = 15 * 60 * 1000;
-
-async function fetchMLBScores(date?: string): Promise<MLBGame[]> {
-  const now = Date.now();
-  if (!date && cachedMLBScores && now - mlbCacheTime < MLB_CACHE_MS) return cachedMLBScores;
-  const targetDate = date || new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-  const data = await (await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${targetDate}&hydrate=linescore`)).json() as any;
-  const games: MLBGame[] = [];
-  for (const dateObj of (data.dates || [])) {
-    for (const game of (dateObj.games || [])) {
-      const status = game.status?.detailedState || "Scheduled";
-      const isFinal = status.toLowerCase().includes("final");
-      const inProgress = status.toLowerCase().includes("progress");
-      games.push({
-        gameId: game.gamePk, date: dateObj.date,
-        homeTeam: game.teams?.home?.team?.name || "",
-        awayTeam: game.teams?.away?.team?.name || "",
-        homeScore: isFinal || inProgress ? (game.teams?.home?.score ?? 0) : 0,
-        awayScore: isFinal || inProgress ? (game.teams?.away?.score ?? 0) : 0,
-        status: isFinal ? "Final" : inProgress ? "In Progress" : "Scheduled",
-      });
-    }
-  }
-  if (!date) { cachedMLBScores = games; mlbCacheTime = now; }
-  return games;
-}
-
 app.get("/poolzone/mlb-scores", async (req, res) => {
   try {
     const games = await fetchMLBScores(req.query.date as string | undefined);
@@ -1510,13 +1481,8 @@ async function autoSyncMLBScores() {
 // MLB: Once daily at 4am Eastern (9am UTC)
 cron.schedule('0 9 * * *', () => { autoSyncMLBScores(); });
 
-// NFL: Every Monday at 2am Eastern (7am UTC) Sep-Feb only
-cron.schedule('0 7 * * 1', () => {
-  const month = new Date().getMonth();
-  if (month >= 8 || month <= 1) {
-    autoSyncNFLScores();
-  }
-});
+// NFL: Every Monday at 2am Eastern (7am UTC) Sep-Feb only - not yet implemented
+// cron.schedule('0 7 * * 1', () => { autoSyncNFLScores(); });
 
 startup();
 
