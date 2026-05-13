@@ -63,13 +63,13 @@ async function loadFromRedis() {
   try {
     console.log("Loading data from Redis...");
     const predictions = await redisGet("predictions");
+    const season = await redisGet("season");
 
     if (predictions) {
       predictionStore = new Map(Object.entries(predictions));
       console.log(`Loaded ${predictionStore.size} predictions from Redis`);
 
-      // ✅ Rebuild season totals from settled predictions
-      // This ensures season record survives deploys
+      // Rebuild season totals from settled predictions
       seasonWins = 0;
       seasonLosses = 0;
       seasonPushes = 0;
@@ -80,6 +80,27 @@ async function loadFromRedis() {
         else if (record.result === "LOSS") seasonLosses++;
         else if (record.result === "PUSH") seasonPushes++;
       }
+
+      // ✅ If no settled predictions found, use saved season record as fallback
+      if (seasonWins === 0 && seasonLosses === 0 && season) {
+        seasonWins = season.wins ?? 0;
+        seasonLosses = season.losses ?? 0;
+        seasonPushes = season.pushes ?? 0;
+        console.log(`No settled predictions found — using saved season record: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
+      } else {
+        console.log(`Rebuilt season record from predictions: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
+      }
+    } else if (season) {
+      // No predictions at all — use saved season record
+      seasonWins = season.wins ?? 0;
+      seasonLosses = season.losses ?? 0;
+      seasonPushes = season.pushes ?? 0;
+      console.log(`Loaded season record from Redis: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
+    }
+  } catch (e) {
+    console.error("Failed to load from Redis:", e);
+  }
+}
 
       console.log(`Rebuilt season record from predictions: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
     }
