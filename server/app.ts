@@ -81,28 +81,20 @@ async function loadFromRedis() {
         else if (record.result === "PUSH") seasonPushes++;
       }
 
-      // ✅ If no settled predictions found, use saved season record as fallback
+      // If no settled predictions found use saved season record as fallback
       if (seasonWins === 0 && seasonLosses === 0 && season) {
         seasonWins = season.wins ?? 0;
         seasonLosses = season.losses ?? 0;
         seasonPushes = season.pushes ?? 0;
-        console.log(`No settled predictions found — using saved season record: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
+        console.log(`Using saved season record: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
       } else {
         console.log(`Rebuilt season record from predictions: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
       }
     } else if (season) {
-      // No predictions at all — use saved season record
       seasonWins = season.wins ?? 0;
       seasonLosses = season.losses ?? 0;
       seasonPushes = season.pushes ?? 0;
-      console.log(`Loaded season record from Redis: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
-    }
-  } catch (e) {
-    console.error("Failed to load from Redis:", e);
-  }
-}
-
-      console.log(`Rebuilt season record from predictions: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
+      console.log(`Loaded season record: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
     }
   } catch (e) {
     console.error("Failed to load from Redis:", e);
@@ -632,7 +624,7 @@ function calculateEdge({
   const runsAdded = score / 20;
   const adjustedTotal = total + runsAdded;
 
-  // ✅ Sanity check — if adjusted total is unrealistic, cap it
+  // Sanity check — cap adjusted total to reasonable range
   const safeAdjustedTotal = Math.max(
     Math.min(adjustedTotal, total + 4),
     Math.max(total - 4, 1)
@@ -818,7 +810,6 @@ app.get("/nfl-games", async (req, res) => {
           );
           if (weatherRes.ok) {
             const wd = await weatherRes.json() as any;
-            // ✅ Cap wind speed at 35mph for NFL too
             const windSpeed = Math.min(Math.round(wd.wind?.speed ?? 0), 35);
             const windType = getWindType(wd.wind?.deg ?? 0, 180);
             const precipitation = wd.pop ? Math.round(wd.pop * 100) : 0;
