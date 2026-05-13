@@ -63,16 +63,25 @@ async function loadFromRedis() {
   try {
     console.log("Loading data from Redis...");
     const predictions = await redisGet("predictions");
-    const season = await redisGet("season");
+
     if (predictions) {
       predictionStore = new Map(Object.entries(predictions));
       console.log(`Loaded ${predictionStore.size} predictions from Redis`);
-    }
-    if (season) {
-      seasonWins = season.wins ?? 0;
-      seasonLosses = season.losses ?? 0;
-      seasonPushes = season.pushes ?? 0;
-      console.log(`Loaded season record: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
+
+      // ✅ Rebuild season totals from settled predictions
+      // This ensures season record survives deploys
+      seasonWins = 0;
+      seasonLosses = 0;
+      seasonPushes = 0;
+
+      for (const record of predictionStore.values()) {
+        if (!record.settled || !record.result) continue;
+        if (record.result === "WIN") seasonWins++;
+        else if (record.result === "LOSS") seasonLosses++;
+        else if (record.result === "PUSH") seasonPushes++;
+      }
+
+      console.log(`Rebuilt season record from predictions: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
     }
   } catch (e) {
     console.error("Failed to load from Redis:", e);
