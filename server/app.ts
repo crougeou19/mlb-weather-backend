@@ -553,7 +553,6 @@ function adjustTempForGameTime(temp: number, commenceTime: string): number {
 // ─── EASTERN TIME DATE HELPERS ────────────────────────────────
 function getTodayET(): { start: Date; end: Date; dateStr: string } {
   const nowET = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-  // EDT is UTC-4, EST is UTC-5 — use -04:00 for summer (MLB season)
   const start = new Date(`${nowET}T00:00:00-04:00`);
   const end = new Date(`${nowET}T23:59:59-04:00`);
   return { start, end, dateStr: nowET };
@@ -603,6 +602,12 @@ function calculateEdge({
   const runsAdded = score / 20;
   const adjustedTotal = total + runsAdded;
 
+  // ✅ Sanity check — if adjusted total is unrealistic, cap it
+  const safeAdjustedTotal = Math.max(
+    Math.min(adjustedTotal, total + 4),
+    Math.max(total - 4, 1)
+  );
+
   let play = "NO EDGE";
   let confidence = "LOW";
   if (score >= 28) { play = "OVER"; confidence = "HIGH"; }
@@ -613,7 +618,7 @@ function calculateEdge({
   return {
     score: Math.round(score), play, confidence,
     runsAdded: Number(runsAdded.toFixed(1)),
-    adjustedTotal: Number(adjustedTotal.toFixed(1)),
+    adjustedTotal: Number(safeAdjustedTotal.toFixed(1)),
     isFixedDome, isRetractable,
     breakdown: {
       pitcherScore: Math.round(pitcherScore),
@@ -783,7 +788,8 @@ app.get("/nfl-games", async (req, res) => {
           );
           if (weatherRes.ok) {
             const wd = await weatherRes.json() as any;
-            const windSpeed = Math.round(wd.wind?.speed ?? 0);
+            // ✅ Cap wind speed at 35mph for NFL too
+            const windSpeed = Math.min(Math.round(wd.wind?.speed ?? 0), 35);
             const windType = getWindType(wd.wind?.deg ?? 0, 180);
             const precipitation = wd.pop ? Math.round(wd.pop * 100) : 0;
 
@@ -1088,7 +1094,6 @@ app.get("/venue-stats", async (req, res) => {
 // ─── MAIN MLB GAMES ───────────────────────────────────────────
 async function fetchGames() {
   const { start, end, dateStr: today } = getTodayET();
-
   const probablePitchers = await fetchProbablePitchers(today);
 
   const oddsRes = await fetch(
@@ -1097,7 +1102,6 @@ async function fetchGames() {
   if (!oddsRes.ok) throw new Error(`Odds API error: ${oddsRes.status}`);
   const oddsData = await oddsRes.json() as any[];
 
-  // ✅ Filter to today ET only — captures late West Coast games correctly
   const todayGames = oddsData.filter((game: any) => {
     const gameTime = new Date(game.commence_time);
     return gameTime >= start && gameTime <= end;
@@ -1172,7 +1176,8 @@ async function fetchGames() {
           if (weatherRes.ok) {
             const wd = await weatherRes.json() as any;
             const windDeg = wd.wind?.deg ?? 0;
-            const windSpeed = Math.round(wd.wind?.speed ?? 0);
+            // ✅ Cap wind at 35mph — anything higher is bad weather data
+            const windSpeed = Math.min(Math.round(wd.wind?.speed ?? 0), 35);
             const windType = getWindType(windDeg, orientation);
             const rawTemp = Math.round(wd.main.temp);
             const adjustedTemp = adjustTempForGameTime(rawTemp, commenceTime);
