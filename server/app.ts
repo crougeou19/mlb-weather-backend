@@ -137,11 +137,32 @@ async function settlePredictions() {
 
       if (!record) { console.log(`No prediction found for ${gameId}`); continue; }
       if (record.settled) { console.log(`Already settled: ${gameId}`); continue; }
-      if (game.status?.abstractGameState !== "Final") { console.log(`Game not final: ${gameId}`); continue; }
+
+      // Skip postponed, cancelled, or suspended games
+      const detailedState = game.status?.detailedState ?? '';
+      if (
+        detailedState.toLowerCase().includes('postponed') ||
+        detailedState.toLowerCase().includes('cancelled') ||
+        detailedState.toLowerCase().includes('suspended')
+      ) {
+        console.log(`Game postponed/cancelled/suspended: ${gameId} — skipping`);
+        continue;
+      }
+
+      if (game.status?.abstractGameState !== "Final") {
+        console.log(`Game not final: ${gameId}`);
+        continue;
+      }
 
       const homeRuns = game.teams?.home?.score ?? 0;
       const awayRuns = game.teams?.away?.score ?? 0;
       const totalRuns = homeRuns + awayRuns;
+
+      // Skip games with 0-0 score — likely postponed or bad data
+      if (totalRuns === 0) {
+        console.log(`Skipping 0-0 score for ${gameId} — likely postponed or no data`);
+        continue;
+      }
 
       let result: "WIN" | "LOSS" | "PUSH" = "PUSH";
       if (record.predictedPlay === "OVER") {
