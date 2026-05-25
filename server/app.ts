@@ -69,12 +69,13 @@ async function loadFromRedis() {
     // Load predictions
     if (predictions) {
       predictionStore = new Map(Object.entries(predictions));
+
       console.log(
         `Loaded ${predictionStore.size} predictions from Redis`
       );
     }
 
-    // Load saved season record
+    // Load season record
     if (
       season &&
       typeof season.wins === "number"
@@ -87,13 +88,13 @@ async function loadFromRedis() {
         `Using saved season record: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`
       );
     } else {
-      // fallback hardcoded backup
+      // fallback backup record
       seasonWins = 104;
       seasonLosses = 59;
       seasonPushes = 0;
 
       console.log(
-        "No saved season found — using hardcoded backup record"
+        "No saved season found — using fallback backup"
       );
     }
 
@@ -109,14 +110,18 @@ async function loadFromRedis() {
 
 async function saveToRedis() {
   try {
-    const predictionsObj = Object.fromEntries(predictionStore);
+    const predictionsObj = Object.fromEntries(
+      predictionStore
+    );
 
     await redisSet("predictions", predictionsObj);
 
     const totalGames =
-      seasonWins + seasonLosses + seasonPushes;
+      seasonWins +
+      seasonLosses +
+      seasonPushes;
 
-    // Prevent accidental overwrite with 0-0
+    // Prevent wiping season record
     if (totalGames > 0) {
       await redisSet("season", {
         wins: seasonWins,
@@ -134,31 +139,11 @@ async function saveToRedis() {
     }
 
   } catch (e) {
-    console.error("Failed to save to Redis:", e);
+    console.error(
+      "Failed to save to Redis:",
+      e
+    );
   }
-}
-
-async function saveToRedis() {
-  try {
-    const predictionsObj = Object.fromEntries(predictionStore);
-    await redisSet("predictions", predictionsObj);
-   const totalGames =
-  seasonWins + seasonLosses + seasonPushes;
-
-if (totalGames > 0) {
-  await redisSet("season", {
-    wins: seasonWins,
-    losses: seasonLosses,
-    pushes: seasonPushes,
-  });
-
-  console.log(
-    `✅ Saved season record: ${seasonWins}-${seasonLosses}-${seasonPushes}`
-  );
-} else {
-  console.log(
-    "⚠️ Prevented empty season overwrite"
-  );
 }
 
 async function settlePredictions() {
