@@ -70,8 +70,8 @@ async function loadFromRedis() {
       console.log(`Loaded ${predictionStore.size} predictions from Redis`);
 
       // Rebuild season totals from settled predictions
-      seasonWins = 0;
-      seasonLosses = 0;
+      seasonWins = 104;
+      seasonLosses = 59;
       seasonPushes = 0;
 
       for (const record of predictionStore.values()) {
@@ -90,12 +90,10 @@ async function loadFromRedis() {
       } else {
         console.log(`Rebuilt season record from predictions: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
       }
-    } else if (season) {
-      seasonWins = season.wins ?? 0;
-      seasonLosses = season.losses ?? 0;
-      seasonPushes = season.pushes ?? 0;
-      console.log(`Loaded season record: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
-    }
+    if (
+  season &&
+  typeof season.wins === "number"
+) {
   } catch (e) {
     console.error("Failed to load from Redis:", e);
   }
@@ -105,11 +103,23 @@ async function saveToRedis() {
   try {
     const predictionsObj = Object.fromEntries(predictionStore);
     await redisSet("predictions", predictionsObj);
-    await redisSet("season", { wins: seasonWins, losses: seasonLosses, pushes: seasonPushes });
-    console.log(`💾 Saved ${predictionStore.size} predictions to Redis`);
-  } catch (e) {
-    console.error("Failed to save to Redis:", e);
-  }
+   const totalGames =
+  seasonWins + seasonLosses + seasonPushes;
+
+if (totalGames > 0) {
+  await redisSet("season", {
+    wins: seasonWins,
+    losses: seasonLosses,
+    pushes: seasonPushes,
+  });
+
+  console.log(
+    `✅ Saved season record: ${seasonWins}-${seasonLosses}-${seasonPushes}`
+  );
+} else {
+  console.log(
+    "⚠️ Prevented empty season overwrite"
+  );
 }
 
 async function settlePredictions() {
@@ -1364,5 +1374,44 @@ async function startup() {
 }
 
 startup();
+app.get("/force-save-season", async (req, res) => {
+  try {
+    await saveToRedis();
 
+    res.json({
+      success: true,
+      season: {
+        wins: seasonWins,
+        losses: seasonLosses,
+        pushes: seasonPushes,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+app.get("/force-save-season", async (req, res) => {
+  try {
+    await saveToRedis();
+
+    res.json({
+      success: true,
+      season: {
+        wins: seasonWins,
+        losses: seasonLosses,
+        pushes: seasonPushes,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+    
 export default app;
