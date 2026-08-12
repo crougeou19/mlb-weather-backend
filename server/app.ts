@@ -689,7 +689,7 @@ app.get("/nfl-games", async (req, res) => {
     const oddsData = await oddsRes.json() as any[];
 
     const now = new Date();
-    const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const sevenDaysFromNow = new Date(now.getTime() + 45 * 24 * 60 * 60 * 1000);
     const upcomingGames = oddsData.filter((game: any) => {
       const gameTime = new Date(game.commence_time);
       return gameTime >= now && gameTime <= sevenDaysFromNow;
