@@ -296,11 +296,9 @@ async function fetchTeamStats(teamName: string): Promise<TeamStats | null> {
     const teamEra = parseFloat(pitching?.era ?? "4.20");
     const bullpenEra = teamEra + 0.35;
     const stats: TeamStats = {
-      teamId,
-      runsPerGame: Number(runsPerGame.toFixed(2)),
+      teamId, runsPerGame: Number(runsPerGame.toFixed(2)),
       last10RunsPerGame: Number(last10RunsPerGame.toFixed(2)),
-      bullpenEra: Number(bullpenEra.toFixed(2)),
-      gamesPlayed,
+      bullpenEra: Number(bullpenEra.toFixed(2)), gamesPlayed,
     };
     teamStatsCache.set(teamName, { data: stats, time: Date.now() });
     return stats;
@@ -344,13 +342,8 @@ function calculateBullpenScore(stats: TeamStats | null): number {
 }
 
 interface PitcherStats {
-  name: string;
-  era: number;
-  fip: number;
-  kPer9: number;
-  hrPer9: number;
-  flyBallRate: number;
-  inningsPitched: number;
+  name: string; era: number; fip: number; kPer9: number;
+  hrPer9: number; flyBallRate: number; inningsPitched: number;
 }
 
 const pitcherCache: Map<string, { data: PitcherStats; time: number }> = new Map();
@@ -374,13 +367,9 @@ async function fetchPitcherStats(playerId: number, playerName: string): Promise<
     const k = parseFloat(stats.strikeOuts ?? "0");
     const fip = ip > 0 ? ((13 * hr + 3 * bb - 2 * k) / ip) + 3.10 : era;
     const pitcherStats: PitcherStats = {
-      name: playerName,
-      era: Number(era.toFixed(2)),
-      fip: Number(fip.toFixed(2)),
-      kPer9: Number(kPer9.toFixed(1)),
-      hrPer9: Number(hrPer9.toFixed(2)),
-      flyBallRate: 35,
-      inningsPitched: ip,
+      name: playerName, era: Number(era.toFixed(2)), fip: Number(fip.toFixed(2)),
+      kPer9: Number(kPer9.toFixed(1)), hrPer9: Number(hrPer9.toFixed(2)),
+      flyBallRate: 35, inningsPitched: ip,
     };
     pitcherCache.set(cacheKey, { data: pitcherStats, time: Date.now() });
     return pitcherStats;
@@ -682,17 +671,20 @@ app.get("/results", (req, res) => {
 // ─── NFL GAMES ────────────────────────────────────────────────
 app.get("/nfl-games", async (req, res) => {
   try {
-    const oddsRes = await fetch(
-      `https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=totals,spreads,h2h&oddsFormat=american`
-    );
+    const [oddsRes, preseasonRes] = await Promise.all([
+      fetch(`https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=totals,spreads,h2h&oddsFormat=american`),
+      fetch(`https://api.the-odds-api.com/v4/sports/americanfootball_nfl_preseason/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=totals,spreads,h2h&oddsFormat=american`),
+    ]);
     if (!oddsRes.ok) throw new Error(`Odds API error: ${oddsRes.status}`);
-    const oddsData = await oddsRes.json() as any[];
+    const regularData = await oddsRes.json() as any[];
+    const preseasonData = preseasonRes.ok ? await preseasonRes.json() as any[] : [];
+    const oddsData = [...preseasonData, ...regularData];
 
     const now = new Date();
-    const sevenDaysFromNow = new Date(now.getTime() + 45 * 24 * 60 * 60 * 1000);
+    const fortyFiveDaysFromNow = new Date(now.getTime() + 45 * 24 * 60 * 60 * 1000);
     const upcomingGames = oddsData.filter((game: any) => {
       const gameTime = new Date(game.commence_time);
-      return gameTime >= now && gameTime <= sevenDaysFromNow;
+      return gameTime >= now && gameTime <= fortyFiveDaysFromNow;
     });
 
     const games = await Promise.all(upcomingGames.map(async (game: any) => {
@@ -745,7 +737,7 @@ app.get("/nfl-games", async (req, res) => {
         } catch (e) {}
       }
       return {
-        id: game.id, sport: "NFL",
+        id: game.id, sport: game.sport_key === "americanfootball_nfl_preseason" ? "NFL Preseason" : "NFL",
         home_team: homeTeam, away_team: awayTeam,
         commence_time: game.commence_time,
         bookmaker: bookmaker?.title ?? "Unknown",
@@ -773,13 +765,9 @@ app.get("/nfl-scores", async (req, res) => {
       const away = competition?.competitors?.find((c: any) => c.homeAway === "away");
       const isFinal = competition?.status?.type?.name === "STATUS_FINAL";
       return {
-        gameId: event.id,
-        week: data.week?.number ?? null,
-        season: data.season?.year ?? null,
-        homeTeam: home?.team?.displayName ?? "",
-        homeAbbr: home?.team?.abbreviation ?? "",
-        awayTeam: away?.team?.displayName ?? "",
-        awayAbbr: away?.team?.abbreviation ?? "",
+        gameId: event.id, week: data.week?.number ?? null, season: data.season?.year ?? null,
+        homeTeam: home?.team?.displayName ?? "", homeAbbr: home?.team?.abbreviation ?? "",
+        awayTeam: away?.team?.displayName ?? "", awayAbbr: away?.team?.abbreviation ?? "",
         homeScore: isFinal ? parseInt(home?.score ?? "0") : null,
         awayScore: isFinal ? parseInt(away?.score ?? "0") : null,
         homeWon: isFinal ? parseInt(home?.score ?? "0") > parseInt(away?.score ?? "0") : null,
@@ -897,8 +885,7 @@ app.get("/venue-stats", async (req, res) => {
               date: dateObj.date, season,
               home: game.teams?.home?.team?.name,
               away: game.teams?.away?.team?.name,
-              homeScore, awayScore,
-              total: homeScore + awayScore,
+              homeScore, awayScore, total: homeScore + awayScore,
             });
           }
         }
