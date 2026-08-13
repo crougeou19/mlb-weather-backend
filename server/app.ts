@@ -52,10 +52,28 @@ interface PredictionRecord {
   result?: "WIN" | "LOSS" | "PUSH";
 }
 
+interface NFLPredictionRecord {
+  gameId: string;
+  date: string;
+  homeTeam: string;
+  awayTeam: string;
+  predictedPlay: string;
+  total: number;
+  confidence: string;
+  settled: boolean;
+  actualScore?: number;
+  result?: "WIN" | "LOSS" | "PUSH";
+}
+
 let predictionStore: Map<string, PredictionRecord> = new Map();
 let seasonWins = 0;
 let seasonLosses = 0;
 let seasonPushes = 0;
+
+let nflPredictionStore: Map<string, NFLPredictionRecord> = new Map();
+let nflSeasonWins = 0;
+let nflSeasonLosses = 0;
+let nflSeasonPushes = 0;
 
 async function loadFromRedis() {
   try {
@@ -77,6 +95,18 @@ async function loadFromRedis() {
       seasonPushes = 0;
       console.log("No saved season found — using fallback backup");
     }
+    const nflPredictions = await redisGet("nfl_predictions");
+    const nflSeason = await redisGet("nfl_season");
+    if (nflPredictions) {
+      nflPredictionStore = new Map(Object.entries(nflPredictions));
+      console.log(`Loaded ${nflPredictionStore.size} NFL predictions from Redis`);
+    }
+    if (nflSeason && typeof nflSeason.wins === "number") {
+      nflSeasonWins = nflSeason.wins;
+      nflSeasonLosses = nflSeason.losses ?? 0;
+      nflSeasonPushes = nflSeason.pushes ?? 0;
+      console.log(`NFL season record: ${nflSeasonWins}W-${nflSeasonLosses}L-${nflSeasonPushes}P`);
+    }
   } catch (e) {
     console.error("Failed to load from Redis:", e);
     seasonWins = 104;
@@ -92,10 +122,12 @@ async function saveToRedis() {
     const totalGames = seasonWins + seasonLosses + seasonPushes;
     if (totalGames > 0) {
       await redisSet("season", { wins: seasonWins, losses: seasonLosses, pushes: seasonPushes });
-      console.log(`✅ Saved season record: ${seasonWins}-${seasonLosses}-${seasonPushes}`);
-    } else {
-      console.log("⚠️ Prevented empty season overwrite");
+      console.log(`✅ Saved MLB season record: ${seasonWins}-${seasonLosses}-${seasonPushes}`);
     }
+    const nflPredictionsObj = Object.fromEntries(nflPredictionStore);
+    await redisSet("nfl_predictions", nflPredictionsObj);
+    await redisSet("nfl_season", { wins: nflSeasonWins, losses: nflSeasonLosses, pushes: nflSeasonPushes });
+    console.log(`✅ Saved NFL season record: ${nflSeasonWins}-${nflSeasonLosses}-${nflSeasonPushes}`);
   } catch (e) {
     console.error("Failed to save to Redis:", e);
   }
@@ -105,7 +137,7 @@ async function settlePredictions() {
   const yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
   const dateStr = yesterday.toISOString().split("T")[0];
-  console.log(`Settling predictions for ${dateStr}...`);
+  console.log(`Settling MLB predictions for ${dateStr}...`);
   try {
     const res = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${dateStr}&hydrate=linescore`);
     const data = await res.json() as any;
@@ -135,11 +167,50 @@ async function settlePredictions() {
       if (result === "WIN") seasonWins++;
       else if (result === "LOSS") seasonLosses++;
       else seasonPushes++;
-      console.log(`✅ Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalRuns} — ${result}`);
+      console.log(`✅ MLB Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalRuns} — ${result}`);
     }
     if (anySettled) await saveToRedis();
   } catch (err: any) {
-    console.error("Error settling predictions:", err.message);
+    console.error("Error settling MLB predictions:", err.message);
+  }
+}
+
+async function settleNFLPredictions() {
+  try {
+    console.log("Settling NFL predictions...");
+    const res = await fetch("https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard");
+    if (!res.ok) return;
+    const data = await res.json() as any;
+    const events = data.events || [];
+    let anySettled = false;
+    for (const event of events) {
+      const competition = event.competitions?.[0];
+      if (competition?.status?.type?.name !== "STATUS_FINAL") continue;
+      const home = competition.competitors?.find((c: any) => c.homeAway === "home");
+      const away = competition.competitors?.find((c: any) => c.homeAway === "away");
+      const homeTeam = home?.team?.displayName;
+      const homeScore = parseInt(home?.score ?? "0");
+      const awayScore = parseInt(away?.score ?? "0");
+      const totalScore = homeScore + awayScore;
+      const gameId = `nfl_${homeTeam?.replace(/\s+/g, '_')}`;
+      const record = nflPredictionStore.get(gameId);
+      if (!record || record.settled) continue;
+      let result: "WIN" | "LOSS" | "PUSH" = "PUSH";
+      if (record.predictedPlay === "OVER") result = totalScore > record.total ? "WIN" : totalScore < record.total ? "LOSS" : "PUSH";
+      else if (record.predictedPlay === "UNDER") result = totalScore < record.total ? "WIN" : totalScore > record.total ? "LOSS" : "PUSH";
+      record.settled = true;
+      record.actualScore = totalScore;
+      record.result = result;
+      nflPredictionStore.set(gameId, record);
+      anySettled = true;
+      if (result === "WIN") nflSeasonWins++;
+      else if (result === "LOSS") nflSeasonLosses++;
+      else nflSeasonPushes++;
+      console.log(`✅ NFL Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalScore} — ${result}`);
+    }
+    if (anySettled) await saveToRedis();
+  } catch (err: any) {
+    console.error("NFL settlement error:", err.message);
   }
 }
 
@@ -233,7 +304,6 @@ const NFL_PARK_FACTORS: Record<string, number> = {
   "Tennessee Titans": 99, "Washington Commanders": 97,
 };
 
-// ESPN team ID mapping
 const NFL_ESPN_IDS: Record<string, number> = {
   "Arizona Cardinals": 22, "Atlanta Falcons": 1, "Baltimore Ravens": 33,
   "Buffalo Bills": 2, "Carolina Panthers": 29, "Chicago Bears": 3,
@@ -248,7 +318,6 @@ const NFL_ESPN_IDS: Record<string, number> = {
   "Tennessee Titans": 10, "Washington Commanders": 28,
 };
 
-// 2024 season stats as baseline (points per game offense/defense)
 const NFL_TEAM_STATS_2024: Record<string, { offPPG: number; defPPG: number }> = {
   "Arizona Cardinals":    { offPPG: 23.1, defPPG: 27.2 },
   "Atlanta Falcons":      { offPPG: 22.1, defPPG: 24.1 },
@@ -306,7 +375,6 @@ async function fetchNFLTeamStats(teamName: string): Promise<{ offPPG: number; de
         }
       }
     }
-    // If no live stats yet, use 2024 baseline
     if (offPPG === 0) {
       const baseline = NFL_TEAM_STATS_2024[teamName];
       if (baseline) { offPPG = baseline.offPPG; defPPG = baseline.defPPG; }
@@ -341,7 +409,6 @@ function calculateNFLDefenseScore(teamName: string): number {
   if (!stats) return 0;
   let score = 0;
   const leagueAvg = 23.0;
-  // High points allowed = bad defense = more scoring = OVER lean
   const defDiff = stats.defPPG - leagueAvg;
   if (defDiff > 5) score += 8;
   else if (defDiff > 2) score += 5;
@@ -677,8 +744,6 @@ function calculateNFLEdge({
   homeDefenseScore: number; awayDefenseScore: number;
 }) {
   let score = 0;
-
-  // Weather factors (only for outdoor stadiums)
   if (!isFixedDome) {
     if (windSpeed >= 20) score -= 12;
     else if (windSpeed >= 15) score -= 8;
@@ -696,42 +761,30 @@ function calculateNFLEdge({
     else if (precipitation >= 30) score -= 3;
     if (windSpeed >= 15 && temp <= 32) score -= 6;
   }
-
-  // Team offense/defense factors
   const offenseScore = (homeOffenseScore + awayOffenseScore) / 2;
   const defenseScore = (homeDefenseScore + awayDefenseScore) / 2;
   score += offenseScore;
   score += defenseScore;
-
-  // Park factor
   score += (parkFactor - 100) * 0.3;
-
   const pointsAdded = (score / 20) * 3;
   const adjustedTotal = total + pointsAdded;
-
-  // Lowered thresholds so more games show edges
   let play = "NO EDGE";
   let confidence = "LOW";
   if (score >= 14) { play = "OVER"; confidence = "HIGH"; }
   else if (score >= 7) { play = "OVER"; confidence = "MEDIUM"; }
   else if (score <= -14) { play = "UNDER"; confidence = "HIGH"; }
   else if (score <= -7) { play = "UNDER"; confidence = "MEDIUM"; }
-
   let spreadLean = "NEUTRAL";
   if (!isFixedDome) {
     if (windSpeed >= 15 || temp <= 32 || precipitation >= 50) spreadLean = "UNDER and home team defense";
     else if (temp >= 75 && windSpeed < 10) spreadLean = "OVER and offensive teams";
   }
-
   return {
     score: Math.round(score), play, confidence,
     pointsAdded: Number(pointsAdded.toFixed(1)),
     adjustedTotal: Number(adjustedTotal.toFixed(1)),
     spreadLean, isFixedDome, isRetractable, parkFactor,
-    breakdown: {
-      offenseScore: Math.round(offenseScore),
-      defenseScore: Math.round(defenseScore),
-    },
+    breakdown: { offenseScore: Math.round(offenseScore), defenseScore: Math.round(defenseScore) },
   };
 }
 
@@ -776,6 +829,30 @@ app.get("/results", (req, res) => {
   });
 });
 
+app.get("/nfl-results", (req, res) => {
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const yesterdayStr = yesterday.toISOString().split("T")[0];
+  const yesterdayResults = Array.from(nflPredictionStore.values()).filter(p => p.date === yesterdayStr && p.settled && p.result);
+  const yesterdayWins = yesterdayResults.filter(p => p.result === "WIN").length;
+  const yesterdayLosses = yesterdayResults.filter(p => p.result === "LOSS").length;
+  const yesterdayTotal = yesterdayWins + yesterdayLosses;
+  const seasonTotal = nflSeasonWins + nflSeasonLosses;
+  res.json({
+    yesterday: {
+      date: yesterdayStr, wins: yesterdayWins, losses: yesterdayLosses,
+      total: yesterdayTotal,
+      pct: yesterdayTotal > 0 ? Math.round((yesterdayWins / yesterdayTotal) * 100) : null,
+      games: yesterdayResults,
+    },
+    season: {
+      wins: nflSeasonWins, losses: nflSeasonLosses, pushes: nflSeasonPushes,
+      total: seasonTotal,
+      pct: seasonTotal > 0 ? Math.round((nflSeasonWins / seasonTotal) * 100) : null,
+    },
+  });
+});
+
 // ─── NFL GAMES ────────────────────────────────────────────────
 app.get("/nfl-games", async (req, res) => {
   try {
@@ -795,6 +872,8 @@ app.get("/nfl-games", async (req, res) => {
       return gameTime >= now && gameTime <= fortyFiveDaysFromNow;
     });
 
+    let nflPredictionsAdded = false;
+
     const games = await Promise.all(upcomingGames.map(async (game: any) => {
       const homeTeam = game.home_team;
       const awayTeam = game.away_team;
@@ -813,7 +892,6 @@ app.get("/nfl-games", async (req, res) => {
       const homeML = h2hMarket?.outcomes?.find((o: any) => o.name === homeTeam)?.price ?? null;
       const awayML = h2hMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.price ?? null;
 
-      // Get team offense/defense scores
       const homeOffenseScore = calculateNFLOffenseScore(homeTeam);
       const awayOffenseScore = calculateNFLOffenseScore(awayTeam);
       const homeDefenseScore = calculateNFLDefenseScore(homeTeam);
@@ -849,6 +927,19 @@ app.get("/nfl-games", async (req, res) => {
                 homeOffenseScore, awayOffenseScore,
                 homeDefenseScore, awayDefenseScore,
               });
+
+              if (edge.play !== "NO EDGE") {
+                const gameDate = new Date(game.commence_time).toISOString().split("T")[0];
+                const gameId = `nfl_${homeTeam.replace(/\s+/g, '_')}`;
+                if (!nflPredictionStore.has(gameId)) {
+                  nflPredictionStore.set(gameId, {
+                    gameId, date: gameDate, homeTeam, awayTeam,
+                    predictedPlay: edge.play, total, confidence: edge.confidence, settled: false,
+                  });
+                  nflPredictionsAdded = true;
+                  console.log(`📝 NFL prediction stored: ${awayTeam} @ ${homeTeam} — ${edge.play} ${total}`);
+                }
+              }
             }
           }
         } catch (e) {}
@@ -871,6 +962,7 @@ app.get("/nfl-games", async (req, res) => {
       };
     }));
 
+    if (nflPredictionsAdded) await saveToRedis();
     res.json(games);
   } catch (err: any) {
     res.status(500).json({ error: "Failed to fetch NFL games", details: err.message });
@@ -1140,7 +1232,7 @@ async function fetchGames() {
             if (!predictionStore.has(gameId) && edge.play !== "NO EDGE") {
               predictionStore.set(gameId, { gameId, date: today, homeTeam, awayTeam, predictedPlay: edge.play, total, confidence: edge.confidence, settled: false });
               newPredictionsAdded = true;
-              console.log(`📝 Stored prediction: ${awayTeam} @ ${homeTeam} — ${edge.play} ${total}`);
+              console.log(`📝 MLB Stored prediction: ${awayTeam} @ ${homeTeam} — ${edge.play} ${total}`);
             }
           }
         }
@@ -1205,7 +1297,11 @@ function scheduleSettlement() {
   setTimeout(() => {
     console.log("Running daily settlement...");
     settlePredictions();
-    setInterval(() => { settlePredictions(); }, 24 * 60 * 60 * 1000);
+    settleNFLPredictions();
+    setInterval(() => {
+      settlePredictions();
+      settleNFLPredictions();
+    }, 24 * 60 * 60 * 1000);
   }, msUntil6am);
 }
 
@@ -1221,7 +1317,7 @@ startup();
 app.get("/force-save-season", async (req, res) => {
   try {
     await saveToRedis();
-    res.json({ success: true, season: { wins: seasonWins, losses: seasonLosses, pushes: seasonPushes } });
+    res.json({ success: true, season: { wins: seasonWins, losses: seasonLosses, pushes: seasonPushes }, nfl: { wins: nflSeasonWins, losses: nflSeasonLosses, pushes: nflSeasonPushes } });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
