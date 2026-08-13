@@ -106,39 +106,27 @@ async function settlePredictions() {
   yesterday.setDate(yesterday.getDate() - 1);
   const dateStr = yesterday.toISOString().split("T")[0];
   console.log(`Settling predictions for ${dateStr}...`);
-  console.log(`Total stored predictions: ${predictionStore.size}`);
   try {
     const res = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${dateStr}&hydrate=linescore`);
     const data = await res.json() as any;
     const games = data?.dates?.[0]?.games || [];
-    console.log(`Found ${games.length} MLB games for ${dateStr}`);
     let anySettled = false;
     for (const game of games) {
       const homeTeamName = game.teams?.home?.team?.name;
       const gameId = `${dateStr}_${homeTeamName?.replace(/\s+/g, '_')}`;
       const record = predictionStore.get(gameId);
-      if (!record) { console.log(`No prediction found for ${gameId}`); continue; }
-      if (record.settled) { console.log(`Already settled: ${gameId}`); continue; }
+      if (!record || record.settled) continue;
       const detailedState = game.status?.detailedState ?? '';
-      if (detailedState.toLowerCase().includes('postponed') || detailedState.toLowerCase().includes('cancelled') || detailedState.toLowerCase().includes('suspended')) {
-        console.log(`Game postponed/cancelled/suspended: ${gameId} — skipping`);
-        continue;
-      }
-      if (game.status?.abstractGameState !== "Final") { console.log(`Game not final: ${gameId}`); continue; }
+      if (detailedState.toLowerCase().includes('postponed') || detailedState.toLowerCase().includes('cancelled') || detailedState.toLowerCase().includes('suspended')) continue;
+      if (game.status?.abstractGameState !== "Final") continue;
       const homeRuns = game.teams?.home?.score ?? 0;
       const awayRuns = game.teams?.away?.score ?? 0;
       const totalRuns = homeRuns + awayRuns;
-      if (totalRuns === 0) { console.log(`Skipping 0-0 score for ${gameId} — likely postponed or no data`); continue; }
+      if (totalRuns === 0) continue;
       let result: "WIN" | "LOSS" | "PUSH" = "PUSH";
-      if (record.predictedPlay === "OVER") {
-        result = totalRuns > record.total ? "WIN" : totalRuns < record.total ? "LOSS" : "PUSH";
-      } else if (record.predictedPlay === "UNDER") {
-        result = totalRuns < record.total ? "WIN" : totalRuns > record.total ? "LOSS" : "PUSH";
-      } else {
-        record.settled = true;
-        predictionStore.set(gameId, record);
-        continue;
-      }
+      if (record.predictedPlay === "OVER") result = totalRuns > record.total ? "WIN" : totalRuns < record.total ? "LOSS" : "PUSH";
+      else if (record.predictedPlay === "UNDER") result = totalRuns < record.total ? "WIN" : totalRuns > record.total ? "LOSS" : "PUSH";
+      else { record.settled = true; predictionStore.set(gameId, record); continue; }
       record.settled = true;
       record.actualRuns = totalRuns;
       record.result = result;
@@ -149,8 +137,6 @@ async function settlePredictions() {
       else seasonPushes++;
       console.log(`✅ Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalRuns} — ${result}`);
     }
-    const settled = Array.from(predictionStore.values()).filter(p => p.settled).length;
-    console.log(`Settlement complete. Total settled: ${settled}, Season: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
     if (anySettled) await saveToRedis();
   } catch (err: any) {
     console.error("Error settling predictions:", err.message);
@@ -247,6 +233,125 @@ const NFL_PARK_FACTORS: Record<string, number> = {
   "Tennessee Titans": 99, "Washington Commanders": 97,
 };
 
+// ESPN team ID mapping
+const NFL_ESPN_IDS: Record<string, number> = {
+  "Arizona Cardinals": 22, "Atlanta Falcons": 1, "Baltimore Ravens": 33,
+  "Buffalo Bills": 2, "Carolina Panthers": 29, "Chicago Bears": 3,
+  "Cincinnati Bengals": 4, "Cleveland Browns": 5, "Dallas Cowboys": 6,
+  "Denver Broncos": 7, "Detroit Lions": 8, "Green Bay Packers": 9,
+  "Houston Texans": 34, "Indianapolis Colts": 11, "Jacksonville Jaguars": 30,
+  "Kansas City Chiefs": 12, "Las Vegas Raiders": 13, "Los Angeles Chargers": 24,
+  "Los Angeles Rams": 14, "Miami Dolphins": 15, "Minnesota Vikings": 16,
+  "New England Patriots": 17, "New Orleans Saints": 18, "New York Giants": 19,
+  "New York Jets": 20, "Philadelphia Eagles": 21, "Pittsburgh Steelers": 23,
+  "San Francisco 49ers": 25, "Seattle Seahawks": 26, "Tampa Bay Buccaneers": 27,
+  "Tennessee Titans": 10, "Washington Commanders": 28,
+};
+
+// 2024 season stats as baseline (points per game offense/defense)
+const NFL_TEAM_STATS_2024: Record<string, { offPPG: number; defPPG: number }> = {
+  "Arizona Cardinals":    { offPPG: 23.1, defPPG: 27.2 },
+  "Atlanta Falcons":      { offPPG: 22.1, defPPG: 24.1 },
+  "Baltimore Ravens":     { offPPG: 30.3, defPPG: 20.0 },
+  "Buffalo Bills":        { offPPG: 28.0, defPPG: 20.5 },
+  "Carolina Panthers":    { offPPG: 16.9, defPPG: 28.5 },
+  "Chicago Bears":        { offPPG: 19.0, defPPG: 26.4 },
+  "Cincinnati Bengals":   { offPPG: 24.3, defPPG: 25.1 },
+  "Cleveland Browns":     { offPPG: 18.5, defPPG: 23.8 },
+  "Dallas Cowboys":       { offPPG: 23.8, defPPG: 26.5 },
+  "Denver Broncos":       { offPPG: 20.3, defPPG: 21.0 },
+  "Detroit Lions":        { offPPG: 33.5, defPPG: 22.5 },
+  "Green Bay Packers":    { offPPG: 26.2, defPPG: 23.1 },
+  "Houston Texans":       { offPPG: 27.0, defPPG: 24.3 },
+  "Indianapolis Colts":   { offPPG: 21.5, defPPG: 24.8 },
+  "Jacksonville Jaguars": { offPPG: 19.0, defPPG: 27.5 },
+  "Kansas City Chiefs":   { offPPG: 27.0, defPPG: 18.5 },
+  "Las Vegas Raiders":    { offPPG: 18.5, defPPG: 27.8 },
+  "Los Angeles Chargers": { offPPG: 24.5, defPPG: 21.5 },
+  "Los Angeles Rams":     { offPPG: 26.0, defPPG: 23.0 },
+  "Miami Dolphins":       { offPPG: 20.5, defPPG: 25.5 },
+  "Minnesota Vikings":    { offPPG: 26.5, defPPG: 24.0 },
+  "New England Patriots": { offPPG: 15.8, defPPG: 27.0 },
+  "New Orleans Saints":   { offPPG: 20.0, defPPG: 25.5 },
+  "New York Giants":      { offPPG: 16.5, defPPG: 27.5 },
+  "New York Jets":        { offPPG: 18.5, defPPG: 22.0 },
+  "Philadelphia Eagles":  { offPPG: 28.5, defPPG: 21.0 },
+  "Pittsburgh Steelers":  { offPPG: 20.0, defPPG: 20.5 },
+  "San Francisco 49ers":  { offPPG: 25.5, defPPG: 21.5 },
+  "Seattle Seahawks":     { offPPG: 24.0, defPPG: 24.5 },
+  "Tampa Bay Buccaneers": { offPPG: 25.5, defPPG: 23.0 },
+  "Tennessee Titans":     { offPPG: 17.5, defPPG: 27.0 },
+  "Washington Commanders":{ offPPG: 26.5, defPPG: 24.0 },
+};
+
+const nflStatsCache: Map<string, { data: any; time: number }> = new Map();
+const NFL_STATS_TTL = 6 * 60 * 60 * 1000;
+
+async function fetchNFLTeamStats(teamName: string): Promise<{ offPPG: number; defPPG: number } | null> {
+  const cached = nflStatsCache.get(teamName);
+  if (cached && Date.now() - cached.time < NFL_STATS_TTL) return cached.data;
+  const espnId = NFL_ESPN_IDS[teamName];
+  if (!espnId) return NFL_TEAM_STATS_2024[teamName] ?? null;
+  try {
+    const res = await fetch(`https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${espnId}/statistics`);
+    if (!res.ok) return NFL_TEAM_STATS_2024[teamName] ?? null;
+    const data = await res.json() as any;
+    const splits = data?.results?.splits?.categories || [];
+    let offPPG = 0;
+    let defPPG = 0;
+    for (const cat of splits) {
+      if (cat.name === "scoring") {
+        for (const stat of (cat.stats || [])) {
+          if (stat.name === "pointsPerGame") offPPG = parseFloat(stat.value ?? "0");
+        }
+      }
+    }
+    // If no live stats yet, use 2024 baseline
+    if (offPPG === 0) {
+      const baseline = NFL_TEAM_STATS_2024[teamName];
+      if (baseline) { offPPG = baseline.offPPG; defPPG = baseline.defPPG; }
+    }
+    const stats = { offPPG, defPPG };
+    nflStatsCache.set(teamName, { data: stats, time: Date.now() });
+    return stats;
+  } catch (e) {
+    return NFL_TEAM_STATS_2024[teamName] ?? null;
+  }
+}
+
+function calculateNFLOffenseScore(teamName: string): number {
+  const stats = NFL_TEAM_STATS_2024[teamName];
+  if (!stats) return 0;
+  let score = 0;
+  const leagueAvg = 23.0;
+  const offDiff = stats.offPPG - leagueAvg;
+  if (offDiff > 8) score += 10;
+  else if (offDiff > 5) score += 7;
+  else if (offDiff > 2) score += 4;
+  else if (offDiff > 0) score += 2;
+  else if (offDiff < -8) score -= 10;
+  else if (offDiff < -5) score -= 7;
+  else if (offDiff < -2) score -= 4;
+  else if (offDiff < 0) score -= 2;
+  return score;
+}
+
+function calculateNFLDefenseScore(teamName: string): number {
+  const stats = NFL_TEAM_STATS_2024[teamName];
+  if (!stats) return 0;
+  let score = 0;
+  const leagueAvg = 23.0;
+  // High points allowed = bad defense = more scoring = OVER lean
+  const defDiff = stats.defPPG - leagueAvg;
+  if (defDiff > 5) score += 8;
+  else if (defDiff > 2) score += 5;
+  else if (defDiff > 0) score += 2;
+  else if (defDiff < -5) score -= 8;
+  else if (defDiff < -2) score -= 5;
+  else if (defDiff < 0) score -= 2;
+  return score;
+}
+
 const MLB_TEAM_IDS: Record<string, number> = {
   "Arizona Diamondbacks": 109, "Atlanta Braves": 144, "Baltimore Orioles": 110,
   "Boston Red Sox": 111, "Chicago Cubs": 112, "Chicago White Sox": 145,
@@ -261,11 +366,8 @@ const MLB_TEAM_IDS: Record<string, number> = {
 };
 
 interface TeamStats {
-  teamId: number;
-  runsPerGame: number;
-  last10RunsPerGame: number;
-  bullpenEra: number;
-  gamesPlayed: number;
+  teamId: number; runsPerGame: number; last10RunsPerGame: number;
+  bullpenEra: number; gamesPlayed: number;
 }
 
 const teamStatsCache: Map<string, { data: TeamStats; time: number }> = new Map();
@@ -512,17 +614,14 @@ function getTodayET(): { start: Date; end: Date; dateStr: string } {
 }
 
 function calculateEdge({
-  windSpeed, windType, temp, humidity, total,
-  isFixedDome, isRetractable,
-  homePitcherScore, awayPitcherScore,
-  parkFactor, homeOffenseScore, awayOffenseScore,
-  homeBullpenScore, awayBullpenScore,
+  windSpeed, windType, temp, humidity, total, isFixedDome, isRetractable,
+  homePitcherScore, awayPitcherScore, parkFactor,
+  homeOffenseScore, awayOffenseScore, homeBullpenScore, awayBullpenScore,
 }: {
-  windSpeed: number; windType: "OUT" | "IN" | "CROSS";
-  temp: number; humidity: number; total: number;
-  isFixedDome: boolean; isRetractable: boolean;
-  homePitcherScore: number; awayPitcherScore: number;
-  parkFactor: number; homeOffenseScore: number; awayOffenseScore: number;
+  windSpeed: number; windType: "OUT" | "IN" | "CROSS"; temp: number;
+  humidity: number; total: number; isFixedDome: boolean; isRetractable: boolean;
+  homePitcherScore: number; awayPitcherScore: number; parkFactor: number;
+  homeOffenseScore: number; awayOffenseScore: number;
   homeBullpenScore: number; awayBullpenScore: number;
 }) {
   let score = 0;
@@ -561,22 +660,25 @@ function calculateEdge({
     runsAdded: Number(runsAdded.toFixed(1)),
     adjustedTotal: Number(safeAdjustedTotal.toFixed(1)),
     isFixedDome, isRetractable,
-    breakdown: {
-      pitcherScore: Math.round(pitcherScore),
-      bullpenScore: Math.round(bullpenScore),
-      offenseScore: Math.round(offenseScore),
-      parkScore: Math.round(parkScore),
-    },
+    breakdown: { pitcherScore: Math.round(pitcherScore), bullpenScore: Math.round(bullpenScore), offenseScore: Math.round(offenseScore), parkScore: Math.round(parkScore) },
     parkFactor,
   };
 }
 
-function calculateNFLEdge({ windSpeed, windType, temp, humidity, precipitation, total, isFixedDome, isRetractable, parkFactor }: {
+function calculateNFLEdge({
+  windSpeed, windType, temp, humidity, precipitation, total,
+  isFixedDome, isRetractable, parkFactor,
+  homeOffenseScore, awayOffenseScore, homeDefenseScore, awayDefenseScore,
+}: {
   windSpeed: number; windType: "OUT" | "IN" | "CROSS"; temp: number;
   humidity: number; precipitation: number; total: number;
   isFixedDome: boolean; isRetractable: boolean; parkFactor: number;
+  homeOffenseScore: number; awayOffenseScore: number;
+  homeDefenseScore: number; awayDefenseScore: number;
 }) {
   let score = 0;
+
+  // Weather factors (only for outdoor stadiums)
   if (!isFixedDome) {
     if (windSpeed >= 20) score -= 12;
     else if (windSpeed >= 15) score -= 8;
@@ -586,6 +688,7 @@ function calculateNFLEdge({ windSpeed, windType, temp, humidity, precipitation, 
     else if (temp <= 32) score -= 8;
     else if (temp <= 40) score -= 5;
     else if (temp <= 50) score -= 3;
+    else if (temp >= 90) score += 4;
     else if (temp >= 85) score += 3;
     else if (temp >= 75) score += 2;
     if (precipitation >= 70) score -= 10;
@@ -593,34 +696,49 @@ function calculateNFLEdge({ windSpeed, windType, temp, humidity, precipitation, 
     else if (precipitation >= 30) score -= 3;
     if (windSpeed >= 15 && temp <= 32) score -= 6;
   }
+
+  // Team offense/defense factors
+  const offenseScore = (homeOffenseScore + awayOffenseScore) / 2;
+  const defenseScore = (homeDefenseScore + awayDefenseScore) / 2;
+  score += offenseScore;
+  score += defenseScore;
+
+  // Park factor
   score += (parkFactor - 100) * 0.3;
-  const pointsAdded = score / 20 * 3;
+
+  const pointsAdded = (score / 20) * 3;
   const adjustedTotal = total + pointsAdded;
+
+  // Lowered thresholds so more games show edges
   let play = "NO EDGE";
   let confidence = "LOW";
-  if (score >= 20) { play = "OVER"; confidence = "HIGH"; }
-  else if (score >= 10) { play = "OVER"; confidence = "MEDIUM"; }
-  else if (score <= -20) { play = "UNDER"; confidence = "HIGH"; }
-  else if (score <= -10) { play = "UNDER"; confidence = "MEDIUM"; }
+  if (score >= 14) { play = "OVER"; confidence = "HIGH"; }
+  else if (score >= 7) { play = "OVER"; confidence = "MEDIUM"; }
+  else if (score <= -14) { play = "UNDER"; confidence = "HIGH"; }
+  else if (score <= -7) { play = "UNDER"; confidence = "MEDIUM"; }
+
   let spreadLean = "NEUTRAL";
   if (!isFixedDome) {
     if (windSpeed >= 15 || temp <= 32 || precipitation >= 50) spreadLean = "UNDER and home team defense";
     else if (temp >= 75 && windSpeed < 10) spreadLean = "OVER and offensive teams";
   }
+
   return {
     score: Math.round(score), play, confidence,
     pointsAdded: Number(pointsAdded.toFixed(1)),
     adjustedTotal: Number(adjustedTotal.toFixed(1)),
     spreadLean, isFixedDome, isRetractable, parkFactor,
+    breakdown: {
+      offenseScore: Math.round(offenseScore),
+      defenseScore: Math.round(defenseScore),
+    },
   };
 }
 
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 const WEATHER_API_KEY = process.env.WEATHER_API_KEY;
 
-app.get("/", (req, res) => {
-  res.send("API is running 🚀");
-});
+app.get("/", (req, res) => { res.send("API is running 🚀"); });
 
 app.get("/results", (req, res) => {
   const yesterday = new Date();
@@ -644,26 +762,16 @@ app.get("/results", (req, res) => {
   const seasonTotal = seasonWins + seasonLosses;
   res.json({
     yesterday: {
-      date: yesterdayStr,
-      wins: yesterdayWins, losses: yesterdayLosses,
+      date: yesterdayStr, wins: yesterdayWins, losses: yesterdayLosses,
       pushes: yesterdayPushes, total: yesterdayTotal,
       pct: yesterdayTotal > 0 ? Math.round((yesterdayWins / yesterdayTotal) * 100) : null,
       games: yesterdayResults,
-      high_confidence: {
-        wins: yesterdayHighWins, losses: yesterdayHighLosses,
-        total: yesterdayHighTotal,
-        pct: yesterdayHighTotal > 0 ? Math.round((yesterdayHighWins / yesterdayHighTotal) * 100) : null,
-      },
+      high_confidence: { wins: yesterdayHighWins, losses: yesterdayHighLosses, total: yesterdayHighTotal, pct: yesterdayHighTotal > 0 ? Math.round((yesterdayHighWins / yesterdayHighTotal) * 100) : null },
     },
     season: {
-      wins: seasonWins, losses: seasonLosses,
-      pushes: seasonPushes, total: seasonTotal,
+      wins: seasonWins, losses: seasonLosses, pushes: seasonPushes, total: seasonTotal,
       pct: seasonTotal > 0 ? Math.round((seasonWins / seasonTotal) * 100) : null,
-      high_confidence: {
-        wins: highConfWins, losses: highConfLosses,
-        pushes: highConfPushes, total: highConfTotal,
-        pct: highConfTotal > 0 ? Math.round((highConfWins / highConfTotal) * 100) : null,
-      },
+      high_confidence: { wins: highConfWins, losses: highConfLosses, pushes: highConfPushes, total: highConfTotal, pct: highConfTotal > 0 ? Math.round((highConfWins / highConfTotal) * 100) : null },
     },
   });
 });
@@ -704,6 +812,13 @@ app.get("/nfl-games", async (req, res) => {
       const awaySpread = spreadsMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.point ?? null;
       const homeML = h2hMarket?.outcomes?.find((o: any) => o.name === homeTeam)?.price ?? null;
       const awayML = h2hMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.price ?? null;
+
+      // Get team offense/defense scores
+      const homeOffenseScore = calculateNFLOffenseScore(homeTeam);
+      const awayOffenseScore = calculateNFLOffenseScore(awayTeam);
+      const homeDefenseScore = calculateNFLDefenseScore(homeTeam);
+      const awayDefenseScore = calculateNFLDefenseScore(awayTeam);
+
       let weather = null;
       let edge = null;
       const stadium = NFL_STADIUM_COORDS[homeTeam];
@@ -731,13 +846,17 @@ app.get("/nfl-games", async (req, res) => {
                 temp: Math.round(wd.main.temp),
                 humidity: wd.main.humidity,
                 precipitation, total, isFixedDome, isRetractable, parkFactor,
+                homeOffenseScore, awayOffenseScore,
+                homeDefenseScore, awayDefenseScore,
               });
             }
           }
         } catch (e) {}
       }
+
       return {
-        id: game.id, sport: game.sport_key === "americanfootball_nfl_preseason" ? "NFL Preseason" : "NFL",
+        id: game.id,
+        sport: game.sport_key === "americanfootball_nfl_preseason" ? "NFL Preseason" : "NFL",
         home_team: homeTeam, away_team: awayTeam,
         commence_time: game.commence_time,
         bookmaker: bookmaker?.title ?? "Unknown",
@@ -745,6 +864,10 @@ app.get("/nfl-games", async (req, res) => {
         home_ml: homeML, away_ml: awayML,
         weather, edge,
         park: { factor: parkFactor, name: stadium?.name ?? "Unknown", isFixedDome, isRetractable },
+        team_stats: {
+          home: { offPPG: NFL_TEAM_STATS_2024[homeTeam]?.offPPG, defPPG: NFL_TEAM_STATS_2024[homeTeam]?.defPPG },
+          away: { offPPG: NFL_TEAM_STATS_2024[awayTeam]?.offPPG, defPPG: NFL_TEAM_STATS_2024[awayTeam]?.defPPG },
+        },
       };
     }));
 
@@ -783,8 +906,7 @@ app.get("/nfl-scores", async (req, res) => {
 });
 
 interface MLBGame {
-  gameId: number; date: string;
-  homeTeam: string; awayTeam: string;
+  gameId: number; date: string; homeTeam: string; awayTeam: string;
   homeScore: number; awayScore: number; status: string;
 }
 
@@ -881,12 +1003,7 @@ app.get("/venue-stats", async (req, res) => {
             if (game.status?.abstractGameState !== "Final") continue;
             const homeScore = game.teams?.home?.score ?? 0;
             const awayScore = game.teams?.away?.score ?? 0;
-            allGames.push({
-              date: dateObj.date, season,
-              home: game.teams?.home?.team?.name,
-              away: game.teams?.away?.team?.name,
-              homeScore, awayScore, total: homeScore + awayScore,
-            });
+            allGames.push({ date: dateObj.date, season, home: game.teams?.home?.team?.name, away: game.teams?.away?.team?.name, homeScore, awayScore, total: homeScore + awayScore });
           }
         }
       } catch (e) {}
@@ -919,11 +1036,8 @@ app.get("/venue-stats", async (req, res) => {
             const logData = await logRes.json() as any;
             const splits = logData?.stats?.[0]?.splits || [];
             for (const split of splits) {
-              if (isHomePitcher) {
-                if (split.isHome === true) allVenueStarts.push({ ...split, season });
-              } else {
-                if (split.opponent?.id === teamId) allVenueStarts.push({ ...split, season });
-              }
+              if (isHomePitcher) { if (split.isHome === true) allVenueStarts.push({ ...split, season }); }
+              else { if (split.opponent?.id === teamId) allVenueStarts.push({ ...split, season }); }
             }
           } catch (e) {}
         }
@@ -937,12 +1051,7 @@ app.get("/venue-stats", async (req, res) => {
         const totalBB = allVenueStarts.reduce((sum: number, s: any) => sum + parseInt(s.stat?.baseOnBalls ?? "0"), 0);
         const venueEra = totalIP > 0 ? Number(((totalER * 9) / totalIP).toFixed(2)) : null;
         const whip = totalIP > 0 ? Number(((totalHits + totalBB) / totalIP).toFixed(2)) : null;
-        return {
-          name: pitcherName, startsAtVenue: allVenueStarts.length,
-          era: venueEra, whip, wins, losses, record: `${wins}-${losses}`,
-          totalK, totalIP: Number(totalIP.toFixed(1)),
-          seasonsLabel: isHomePitcher ? `${currentYear} season` : `${seasons[seasons.length - 1]}-${seasons[0]}`,
-        };
+        return { name: pitcherName, startsAtVenue: allVenueStarts.length, era: venueEra, whip, wins, losses, record: `${wins}-${losses}`, totalK, totalIP: Number(totalIP.toFixed(1)), seasonsLabel: isHomePitcher ? `${currentYear} season` : `${seasons[seasons.length - 1]}-${seasons[0]}` };
       } catch (e: any) {
         return { name: pitcherName, startsAtVenue: 0, era: null, record: "Data unavailable" };
       }
@@ -1096,10 +1205,7 @@ function scheduleSettlement() {
   setTimeout(() => {
     console.log("Running daily settlement...");
     settlePredictions();
-    setInterval(() => {
-      console.log("Running daily settlement...");
-      settlePredictions();
-    }, 24 * 60 * 60 * 1000);
+    setInterval(() => { settlePredictions(); }, 24 * 60 * 60 * 1000);
   }, msUntil6am);
 }
 
