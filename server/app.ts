@@ -870,6 +870,7 @@ app.get("/nfl-games", async (req, res) => {
     const upcomingGames = oddsData.filter((game: any) => {
       const gameTime = new Date(game.commence_time);
       return gameTime >= now && gameTime <= sevenDaysFromNow;
+    });
 
     let nflPredictionsAdded = false;
 
@@ -1186,7 +1187,6 @@ async function fetchGames() {
     const overLine = totalsMarket?.outcomes?.find((o: any) => o.name === "Over");
     const rawTotal = overLine?.point ?? null;
     const total = (rawTotal !== null && rawTotal >= 5.5 && rawTotal <= 13.5) ? rawTotal : null;
-    if (rawTotal !== null && (rawTotal < 5.5 || rawTotal > 13.5)) console.log(`⚠️ Filtered bad total for ${homeTeam}: ${rawTotal}`);
     const homeML = h2hMarket?.outcomes?.find((o: any) => o.name === homeTeam)?.price ?? null;
     const awayML = h2hMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.price ?? null;
     const pitchers = probablePitchers.get(homeTeam);
