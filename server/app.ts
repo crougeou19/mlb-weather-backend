@@ -44,9 +44,18 @@ interface PredictionRecord {
   date: string;
   homeTeam: string;
   awayTeam: string;
+  commenceTime?: string;
+  lockedAt?: string;
+  lockRecordedAt?: string;
+  isLocked?: boolean;
   predictedPlay: string;
   total: number;
   confidence: string;
+  modelProjection?: number | null;
+  edge?: any;
+  bookmaker?: string;
+  homeMoneyline?: number | null;
+  awayMoneyline?: number | null;
   settled: boolean;
   actualRuns?: number;
   result?: "WIN" | "LOSS" | "PUSH";
@@ -57,9 +66,20 @@ interface NFLPredictionRecord {
   date: string;
   homeTeam: string;
   awayTeam: string;
+  commenceTime?: string;
+  lockedAt?: string;
+  lockRecordedAt?: string;
+  isLocked?: boolean;
   predictedPlay: string;
   total: number;
   confidence: string;
+  modelProjection?: number | null;
+  edge?: any;
+  bookmaker?: string;
+  homeMoneyline?: number | null;
+  awayMoneyline?: number | null;
+  homeSpread?: number | null;
+  awaySpread?: number | null;
   settled: boolean;
   actualScore?: number;
   result?: "WIN" | "LOSS" | "PUSH";
@@ -74,6 +94,93 @@ let nflPredictionStore: Map<string, NFLPredictionRecord> = new Map();
 let nflSeasonWins = 0;
 let nflSeasonLosses = 0;
 let nflSeasonPushes = 0;
+
+type AnyPredictionRecord = PredictionRecord | NFLPredictionRecord;
+
+function findPredictionForMatch<T extends AnyPredictionRecord>(
+  store: Map<string, T>,
+  date: string,
+  homeTeam: string,
+  awayTeam?: string,
+  commenceTime?: string,
+): [string, T] | undefined {
+  const matches = Array.from(store.entries()).filter(([, record]) =>
+    record.date === date
+    && record.homeTeam === homeTeam
+    && (!awayTeam || record.awayTeam === awayTeam)
+  );
+  const lockedMatches = matches.filter(([, record]) => record.isLocked && record.lockedAt);
+  const candidates = lockedMatches.length > 0 ? lockedMatches : matches;
+  if (candidates.length <= 1 || !commenceTime) return candidates[0];
+
+  const targetMs = new Date(commenceTime).getTime();
+  if (!Number.isFinite(targetMs)) return candidates[0];
+  return candidates.slice().sort(([, a], [, b]) => {
+    const aMs = new Date(a.commenceTime ?? "").getTime();
+    const bMs = new Date(b.commenceTime ?? "").getTime();
+    const aDistance = Number.isFinite(aMs) ? Math.abs(aMs - targetMs) : Number.MAX_SAFE_INTEGER;
+    const bDistance = Number.isFinite(bMs) ? Math.abs(bMs - targetMs) : Number.MAX_SAFE_INTEGER;
+    return aDistance - bDistance;
+  })[0];
+}
+
+function upsertPregameDraft<T extends AnyPredictionRecord>(
+  store: Map<string, T>,
+  snapshot: T,
+): boolean {
+  const existing = store.get(snapshot.gameId);
+  if (existing?.isLocked || existing?.lockedAt) return false;
+
+  const commenceMs = new Date(snapshot.commenceTime ?? "").getTime();
+  if (!Number.isFinite(commenceMs)) {
+    console.error(`Cannot track prediction ${snapshot.gameId}: invalid commence_time`);
+    return false;
+  }
+
+  // Never create or overwrite an official pick from data calculated after start.
+  // The lock timer freezes the most recent persisted pregame draft.
+  if (Date.now() >= commenceMs) return false;
+
+  store.set(snapshot.gameId, {
+    ...snapshot,
+    isLocked: false,
+    lockedAt: undefined,
+    lockRecordedAt: undefined,
+    settled: existing?.settled ?? false,
+    actualRuns: (existing as PredictionRecord | undefined)?.actualRuns,
+    actualScore: (existing as NFLPredictionRecord | undefined)?.actualScore,
+    result: existing?.result,
+  });
+  return true;
+}
+
+async function lockDuePredictions(): Promise<void> {
+  const now = Date.now();
+  const lockRecordedAt = new Date(now).toISOString();
+  let changed = false;
+
+  for (const [sport, store] of [
+    ["MLB", predictionStore],
+    ["NFL", nflPredictionStore],
+  ] as const) {
+    for (const [gameId, record] of store.entries()) {
+      if (record.isLocked || record.lockedAt || !record.commenceTime) continue;
+      const commenceMs = new Date(record.commenceTime).getTime();
+      if (!Number.isFinite(commenceMs) || commenceMs > now) continue;
+
+      const lockedAt = new Date(commenceMs).toISOString();
+      store.set(gameId, { ...record, isLocked: true, lockedAt, lockRecordedAt });
+      changed = true;
+      console.log(
+        `🔒 ${sport} official pick locked: ${record.awayTeam} @ ${record.homeTeam}`
+        + ` — ${record.predictedPlay} ${record.total} — ${record.confidence}`
+        + ` — effective ${lockedAt} — recorded ${lockRecordedAt}`,
+      );
+    }
+  }
+
+  if (changed) await saveToRedis();
+}
 
 async function loadFromRedis() {
   try {
@@ -115,7 +222,16 @@ async function loadFromRedis() {
   }
 }
 
-async function saveToRedis() {
+let redisSaveQueue: Promise<void> = Promise.resolve();
+
+function saveToRedis(): Promise<void> {
+  redisSaveQueue = redisSaveQueue
+    .catch(() => {})
+    .then(saveToRedisNow);
+  return redisSaveQueue;
+}
+
+async function saveToRedisNow() {
   try {
     const predictionsObj = Object.fromEntries(predictionStore);
     await redisSet("predictions", predictionsObj);
@@ -145,9 +261,17 @@ async function settlePredictions() {
     let anySettled = false;
     for (const game of games) {
       const homeTeamName = game.teams?.home?.team?.name;
-      const gameId = `${dateStr}_${homeTeamName?.replace(/\s+/g, '_')}`;
-      const record = predictionStore.get(gameId);
-      if (!record || record.settled) continue;
+      const awayTeamName = game.teams?.away?.team?.name;
+      const match = findPredictionForMatch(
+        predictionStore,
+        dateStr,
+        homeTeamName,
+        awayTeamName,
+        game.gameDate,
+      );
+      if (!match) continue;
+      const [gameId, record] = match;
+      if (record.settled || !record.isLocked) continue;
       const detailedState = game.status?.detailedState ?? '';
       if (detailedState.toLowerCase().includes('postponed') || detailedState.toLowerCase().includes('cancelled') || detailedState.toLowerCase().includes('suspended')) continue;
       if (game.status?.abstractGameState !== "Final") continue;
@@ -189,15 +313,30 @@ async function settleNFLPredictions() {
       const home = competition.competitors?.find((c: any) => c.homeAway === "home");
       const away = competition.competitors?.find((c: any) => c.homeAway === "away");
       const homeTeam = home?.team?.displayName;
+      const awayTeam = away?.team?.displayName;
       const homeScore = parseInt(home?.score ?? "0");
       const awayScore = parseInt(away?.score ?? "0");
       const totalScore = homeScore + awayScore;
-      const gameId = `nfl_${homeTeam?.replace(/\s+/g, '_')}`;
-      const record = nflPredictionStore.get(gameId);
-      if (!record || record.settled) continue;
+      const eventDate = new Date(event.date).toISOString().split("T")[0];
+      const match = findPredictionForMatch(
+        nflPredictionStore,
+        eventDate,
+        homeTeam,
+        awayTeam,
+        event.date,
+      );
+      if (!match) continue;
+      const [gameId, record] = match;
+      if (record.settled || !record.isLocked) continue;
       let result: "WIN" | "LOSS" | "PUSH" = "PUSH";
       if (record.predictedPlay === "OVER") result = totalScore > record.total ? "WIN" : totalScore < record.total ? "LOSS" : "PUSH";
       else if (record.predictedPlay === "UNDER") result = totalScore < record.total ? "WIN" : totalScore > record.total ? "LOSS" : "PUSH";
+      else {
+        record.settled = true;
+        nflPredictionStore.set(gameId, record);
+        anySettled = true;
+        continue;
+      }
       record.settled = true;
       record.actualScore = totalScore;
       record.result = result;
@@ -872,7 +1011,7 @@ app.get("/nfl-games", async (req, res) => {
       return gameTime >= now && gameTime <= sevenDaysFromNow;
     });
 
-    let nflPredictionsAdded = false;
+    let nflPredictionsChanged = false;
 
     const games = await Promise.all(upcomingGames.map(async (game: any) => {
       const homeTeam = game.home_team;
@@ -927,33 +1066,61 @@ app.get("/nfl-games", async (req, res) => {
                 homeOffenseScore, awayOffenseScore,
                 homeDefenseScore, awayDefenseScore,
               });
-
-              if (edge.play !== "NO EDGE") {
-                const gameDate = new Date(game.commence_time).toISOString().split("T")[0];
-                const gameId = `nfl_${homeTeam.replace(/\s+/g, '_')}`;
-                if (!nflPredictionStore.has(gameId)) {
-                  nflPredictionStore.set(gameId, {
-                    gameId, date: gameDate, homeTeam, awayTeam,
-                    predictedPlay: edge.play, total, confidence: edge.confidence, settled: false,
-                  });
-                  nflPredictionsAdded = true;
-                  console.log(`📝 NFL prediction stored: ${awayTeam} @ ${homeTeam} — ${edge.play} ${total}`);
-                }
+              const gameDate = new Date(game.commence_time).toISOString().split("T")[0];
+              const changed = upsertPregameDraft(nflPredictionStore, {
+                gameId: game.id,
+                date: gameDate,
+                homeTeam,
+                awayTeam,
+                commenceTime: game.commence_time,
+                predictedPlay: edge.play,
+                total,
+                confidence: edge.confidence,
+                modelProjection: edge.adjustedTotal,
+                edge,
+                bookmaker: bookmaker?.title ?? "Unknown",
+                homeMoneyline: homeML,
+                awayMoneyline: awayML,
+                homeSpread,
+                awaySpread,
+                settled: false,
+              });
+              if (changed) {
+                nflPredictionsChanged = true;
+                console.log(`📝 NFL pregame draft updated: ${awayTeam} @ ${homeTeam} — ${edge.play} ${total} — ${edge.confidence}`);
               }
             }
           }
         } catch (e) {}
       }
 
+      const official = nflPredictionStore.get(game.id);
+      const isLocked = Boolean(official?.isLocked && official.lockedAt);
+      const responseEdge = isLocked ? official?.edge : edge;
+      const responseTotal = isLocked ? official?.total : total;
       return {
         id: game.id,
         sport: game.sport_key === "americanfootball_nfl_preseason" ? "NFL Preseason" : "NFL",
         home_team: homeTeam, away_team: awayTeam,
         commence_time: game.commence_time,
-        bookmaker: bookmaker?.title ?? "Unknown",
-        total, home_spread: homeSpread, away_spread: awaySpread,
-        home_ml: homeML, away_ml: awayML,
-        weather, edge,
+        bookmaker: isLocked ? official?.bookmaker : (bookmaker?.title ?? "Unknown"),
+        total: responseTotal,
+        home_spread: isLocked ? (official as NFLPredictionRecord)?.homeSpread : homeSpread,
+        away_spread: isLocked ? (official as NFLPredictionRecord)?.awaySpread : awaySpread,
+        home_ml: isLocked ? official?.homeMoneyline : homeML,
+        away_ml: isLocked ? official?.awayMoneyline : awayML,
+        weather,
+        edge: responseEdge,
+        is_locked: isLocked,
+        locked_at: isLocked ? official?.lockedAt : null,
+        official_pick: isLocked ? {
+          play: official?.predictedPlay,
+          confidence: official?.confidence,
+          line: official?.total,
+          model_projection: official?.modelProjection,
+          edge: official?.edge,
+          locked_at: official?.lockedAt,
+        } : null,
         park: { factor: parkFactor, name: stadium?.name ?? "Unknown", isFixedDome, isRetractable },
         team_stats: {
           home: { offPPG: NFL_TEAM_STATS_2024[homeTeam]?.offPPG, defPPG: NFL_TEAM_STATS_2024[homeTeam]?.defPPG },
@@ -962,7 +1129,7 @@ app.get("/nfl-games", async (req, res) => {
       };
     }));
 
-    if (nflPredictionsAdded) await saveToRedis();
+    if (nflPredictionsChanged) await saveToRedis();
     res.json(games);
   } catch (err: any) {
     res.status(500).json({ error: "Failed to fetch NFL games", details: err.message });
@@ -1172,7 +1339,7 @@ async function fetchGames() {
     return gameTime >= start && gameTime <= end;
   });
   console.log(`Found ${todayGames.length} games for today (${today} ET)`);
-  let newPredictionsAdded = false;
+  let predictionsChanged = false;
   const results = await Promise.all(todayGames.map(async (game: any) => {
     const homeTeam = game.home_team;
     const awayTeam = game.away_team;
@@ -1227,20 +1394,52 @@ async function fetchGames() {
               total, isFixedDome, isRetractable, homePitcherScore, awayPitcherScore,
               parkFactor, homeOffenseScore, awayOffenseScore, homeBullpenScore, awayBullpenScore,
             });
-            const gameId = `${today}_${homeTeam.replace(/\s+/g, '_')}`;
-            if (!predictionStore.has(gameId) && edge.play !== "NO EDGE") {
-              predictionStore.set(gameId, { gameId, date: today, homeTeam, awayTeam, predictedPlay: edge.play, total, confidence: edge.confidence, settled: false });
-              newPredictionsAdded = true;
-              console.log(`📝 MLB Stored prediction: ${awayTeam} @ ${homeTeam} — ${edge.play} ${total}`);
+            const changed = upsertPregameDraft(predictionStore, {
+              gameId: game.id,
+              date: today,
+              homeTeam,
+              awayTeam,
+              commenceTime,
+              predictedPlay: edge.play,
+              total,
+              confidence: edge.confidence,
+              modelProjection: edge.adjustedTotal,
+              edge,
+              bookmaker: bookmaker?.title ?? "Unknown",
+              homeMoneyline: homeML,
+              awayMoneyline: awayML,
+              settled: false,
+            });
+            if (changed) {
+              predictionsChanged = true;
+              console.log(`📝 MLB pregame draft updated: ${awayTeam} @ ${homeTeam} — ${edge.play} ${total} — ${edge.confidence}`);
             }
           }
         }
       } catch (e) {}
     }
+    const official = predictionStore.get(game.id);
+    const isLocked = Boolean(official?.isLocked && official.lockedAt);
+    const responseEdge = isLocked ? official?.edge : edge;
+    const responseTotal = isLocked ? official?.total : total;
     return {
       id: game.id, home_team: homeTeam, away_team: awayTeam, commence_time: commenceTime,
-      bookmaker: bookmaker?.title ?? "Unknown", total, home_ml: homeML, away_ml: awayML,
-      weather, edge,
+      bookmaker: isLocked ? official?.bookmaker : (bookmaker?.title ?? "Unknown"),
+      total: responseTotal,
+      home_ml: isLocked ? official?.homeMoneyline : homeML,
+      away_ml: isLocked ? official?.awayMoneyline : awayML,
+      weather,
+      edge: responseEdge,
+      is_locked: isLocked,
+      locked_at: isLocked ? official?.lockedAt : null,
+      official_pick: isLocked ? {
+        play: official?.predictedPlay,
+        confidence: official?.confidence,
+        line: official?.total,
+        model_projection: official?.modelProjection,
+        edge: official?.edge,
+        locked_at: official?.lockedAt,
+      } : null,
       park: { factor: parkFactor, hrFactor: parkData.hr, name: parkData.name, hitterFriendly: parkFactor > 102, pitcherFriendly: parkFactor < 98 },
       team_stats: {
         home: homeStats ? { runsPerGame: homeStats.runsPerGame, last10RunsPerGame: homeStats.last10RunsPerGame, bullpenEra: homeStats.bullpenEra } : null,
@@ -1252,7 +1451,7 @@ async function fetchGames() {
       },
     };
   }));
-  if (newPredictionsAdded) await saveToRedis();
+  if (predictionsChanged) await saveToRedis();
   return results;
 }
 
@@ -1306,8 +1505,10 @@ function scheduleSettlement() {
 
 async function startup() {
   await loadFromRedis();
+  await lockDuePredictions();
   await refreshCache();
   setInterval(refreshCache, 30 * 60 * 1000);
+  setInterval(lockDuePredictions, 15 * 1000);
   scheduleSettlement();
 }
 
