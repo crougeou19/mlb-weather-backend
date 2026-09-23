@@ -992,6 +992,80 @@ app.get("/nfl-results", (req, res) => {
   });
 });
 
+// ESPN's official season calendar assigns games to NFL weeks (Thursday through
+// Monday, including games that cross UTC midnight). Never derive this from an
+// ISO/calendar week or from the time a result was settled.
+type NFLRecordSummary = {
+  wins: number;
+  losses: number;
+  pushes: number;
+  pct: number;
+  confidence: Record<"HIGH" | "MEDIUM" | "LOW", { wins: number; losses: number; pushes: number }>;
+};
+
+function nflRecordSummary(records: NFLPredictionRecord[]): NFLRecordSummary {
+  const summary: NFLRecordSummary = {
+    wins: 0, losses: 0, pushes: 0, pct: 0,
+    confidence: {
+      HIGH: { wins: 0, losses: 0, pushes: 0 },
+      MEDIUM: { wins: 0, losses: 0, pushes: 0 },
+      LOW: { wins: 0, losses: 0, pushes: 0 },
+    },
+  };
+  for (const record of records) {
+    if (record.result !== "WIN" && record.result !== "LOSS" && record.result !== "PUSH") continue;
+    const tier = record.confidence as "HIGH" | "MEDIUM" | "LOW";
+    if (!summary.confidence[tier]) continue;
+    const field = record.result === "WIN" ? "wins" : record.result === "LOSS" ? "losses" : "pushes";
+    summary[field]++;
+    summary.confidence[tier][field]++;
+  }
+  const decisions = summary.wins + summary.losses;
+  summary.pct = decisions ? Math.round(summary.wins / decisions * 100) : 0;
+  return summary;
+}
+
+app.get("/nfl-records", async (req, res) => {
+  try {
+    const response = await fetch("https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard");
+    if (!response.ok) throw new Error(`NFL schedule unavailable: ${response.status}`);
+    const schedule = await response.json() as any;
+    const calendars = schedule.leagues?.[0]?.calendar as any[] | undefined;
+    const regular = calendars?.find(c => c.value === "2");
+    if (!regular?.startDate || !Array.isArray(regular.entries)) {
+      throw new Error("NFL regular season calendar is unavailable");
+    }
+    const now = Date.now();
+    const seasonStart = new Date(regular.startDate).getTime();
+    const activeCalendar = calendars?.find(c => Array.isArray(c.entries) &&
+      now >= new Date(c.startDate).getTime() && now < new Date(c.endDate).getTime() + 60_000);
+    const activeWeek = activeCalendar?.entries.find((entry: any) =>
+      now >= new Date(entry.startDate).getTime() && now < new Date(entry.endDate).getTime() + 60_000);
+    const eligible = Array.from(nflPredictionStore.values()).filter(record => {
+      const kickoff = new Date(record.commenceTime ?? "").getTime();
+      return record.isLocked === true && Boolean(record.lockedAt) && record.settled === true
+        && (record.predictedPlay === "OVER" || record.predictedPlay === "UNDER")
+        && Number.isFinite(kickoff) && kickoff >= seasonStart && kickoff <= now;
+    });
+    const season = nflRecordSummary(eligible);
+    const week = activeWeek ? {
+      label: activeWeek.label as string,
+      number: Number(activeWeek.value),
+      start: activeWeek.startDate as string,
+      end: activeWeek.endDate as string,
+      ...nflRecordSummary(eligible.filter(record => {
+        const kickoff = new Date(record.commenceTime!).getTime();
+        return kickoff >= new Date(activeWeek.startDate).getTime()
+          && kickoff < new Date(activeWeek.endDate).getTime() + 60_000;
+      })),
+    } : null;
+    res.json({ season: { year: schedule.season?.year, ...season }, week });
+  } catch (err: any) {
+    console.error("NFL record summary error:", err);
+    res.status(502).json({ error: "NFL record summary unavailable" });
+  }
+});
+
 // ─── NFL GAMES ────────────────────────────────────────────────
 app.get("/nfl-games", async (req, res) => {
   try {

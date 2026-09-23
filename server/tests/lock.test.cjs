@@ -71,6 +71,19 @@ function harness(now, redis = new Map()) {
       layer.route.stack[0].handle({}, { json(value) { body = value; } });
       return JSON.parse(JSON.stringify(body));
     },
+    async nflRecords() {
+      const layer = api.app._router.stack.find(item => item.route?.path === "/nfl-records");
+      assert.ok(layer, "NFL record summary route must exist");
+      let body;
+      let status = 200;
+      const res = {
+        status(code) { status = code; return this; },
+        json(value) { body = value; },
+      };
+      await layer.route.stack[0].handle({}, res);
+      assert.equal(status, 200, JSON.stringify(body));
+      return JSON.parse(JSON.stringify(body));
+    },
   };
 }
 
@@ -280,4 +293,52 @@ test("NFL settlement and /nfl-results use the locked pick/line exactly once", as
   assert.equal(results.yesterday.games[0].confidence, "HIGH");
   await h.api.settleNFLPredictions();
   assert.equal(h.api.stats().nflSeasonWins, 1);
+});
+
+test("official NFL calendar groups Thursday, Sunday and Monday games and resets at the next week", async () => {
+  const h = harness("2026-09-29T12:00:00Z");
+  h.responses.nfl = {
+    season: { year: 2026 },
+    leagues: [{ calendar: [
+      {
+        value: "2", startDate: "2026-09-06T07:00Z", endDate: "2027-01-13T07:59Z",
+        entries: [
+          { label: "Week 2", value: "2", startDate: "2026-09-16T07:00Z", endDate: "2026-09-23T06:59Z" },
+          { label: "Week 3", value: "3", startDate: "2026-09-23T07:00Z", endDate: "2026-09-30T06:59Z" },
+          { label: "Week 4", value: "4", startDate: "2026-09-30T07:00Z", endDate: "2026-10-07T06:59Z" },
+        ],
+      },
+    ] }],
+  };
+  const put = (id, time, confidence, result, overrides = {}) => {
+    const record = nflDraft(id, time, {
+      confidence, result, settled: true, isLocked: true, lockedAt: time, ...overrides,
+    });
+    h.api.nfl().set(id, record);
+  };
+  put("week-2", "2026-09-22T00:15:00Z", "HIGH", "LOSS");
+  put("thursday", "2026-09-24T00:15:00Z", "HIGH", "WIN");
+  put("sunday", "2026-09-27T17:00:00Z", "MEDIUM", "LOSS");
+  put("monday-after-midnight", "2026-09-29T00:15:00Z", "LOW", "WIN");
+  put("push", "2026-09-28T20:00:00Z", "MEDIUM", "PUSH");
+  put("unlocked", "2026-09-27T17:00:00Z", "HIGH", "WIN", { isLocked: false });
+  put("unsettled", "2026-09-27T17:00:00Z", "HIGH", "WIN", { settled: false });
+  put("no-edge", "2026-09-27T17:00:00Z", "HIGH", "WIN", { predictedPlay: "NO EDGE" });
+  put("prior-season", "2025-09-27T17:00:00Z", "HIGH", "WIN");
+
+  const { week, season } = await h.nflRecords();
+  assert.equal(week.label, "Week 3");
+  assert.equal(week.number, 3);
+  assert.deepEqual([week.wins, week.losses, week.pushes, week.pct], [2, 1, 1, 67]);
+  assert.deepEqual(week.confidence.HIGH, { wins: 1, losses: 0, pushes: 0 });
+  assert.deepEqual(week.confidence.MEDIUM, { wins: 0, losses: 1, pushes: 1 });
+  assert.deepEqual(week.confidence.LOW, { wins: 1, losses: 0, pushes: 0 });
+  assert.deepEqual([season.wins, season.losses, season.pushes, season.pct], [2, 2, 1, 50]);
+  assert.deepEqual(season.confidence.HIGH, { wins: 1, losses: 1, pushes: 0 });
+
+  h.setTime("2026-09-30T07:00:00Z");
+  const next = await h.nflRecords();
+  assert.equal(next.week.label, "Week 4");
+  assert.deepEqual([next.week.wins, next.week.losses, next.week.pct], [0, 0, 0]);
+  assert.deepEqual([next.season.wins, next.season.losses], [2, 2]);
 });
