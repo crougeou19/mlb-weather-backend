@@ -41,6 +41,25 @@ async function redisSet(key: string, value: any): Promise<void> {
   if (data?.result !== "OK") throw new Error(`Redis SET ${key} returned an invalid response`);
 }
 
+async function redisSaveMlb(predictions: Record<string, PredictionRecord>): Promise<void> {
+  // One Redis command prevents a settled prediction from being durable without its season count.
+  const res = await fetch(`${REDIS_URL}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${REDIS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify([
+      "MSET",
+      "predictions", JSON.stringify(predictions),
+      "season", JSON.stringify({ wins: seasonWins, losses: seasonLosses, pushes: seasonPushes }),
+    ]),
+  });
+  if (!res.ok) throw new Error(`Redis MLB MSET failed: HTTP ${res.status}`);
+  const data = await res.json() as any;
+  if (data?.result !== "OK") throw new Error("Redis MLB MSET returned an invalid response");
+}
+
 interface PredictionRecord {
   gameId: string;
   date: string;
@@ -92,6 +111,7 @@ let seasonWins = 0;
 let seasonLosses = 0;
 let seasonPushes = 0;
 let seasonReady = false;
+let mlbSettlementSavePending = false;
 
 let nflPredictionStore: Map<string, NFLPredictionRecord> = new Map();
 let nflSeasonWins = 0;
@@ -240,9 +260,7 @@ function saveToRedis(sport: "MLB" | "NFL" | "BOTH" = "BOTH"): Promise<void> {
 async function saveToRedisNow(sport: "MLB" | "NFL" | "BOTH") {
   if (sport !== "NFL") {
     if (!seasonReady) throw new Error("Cannot save MLB season before a successful Redis load");
-    const predictionsObj = Object.fromEntries(predictionStore);
-    await redisSet("predictions", predictionsObj);
-    await redisSet("season", { wins: seasonWins, losses: seasonLosses, pushes: seasonPushes });
+    await redisSaveMlb(Object.fromEntries(predictionStore));
     console.log(`✅ Saved MLB season record: ${seasonWins}-${seasonLosses}-${seasonPushes}`);
   }
   if (sport !== "MLB") {
@@ -257,47 +275,68 @@ async function settlePredictions() {
   const yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
   const dateStr = yesterday.toISOString().split("T")[0];
-  console.log(`Settling MLB predictions for ${dateStr}...`);
   try {
-    const res = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${dateStr}&hydrate=linescore`);
-    const data = await res.json() as any;
-    const games = data?.dates?.[0]?.games || [];
-    let anySettled = false;
-    for (const game of games) {
-      const homeTeamName = game.teams?.home?.team?.name;
-      const awayTeamName = game.teams?.away?.team?.name;
-      const match = findPredictionForMatch(
-        predictionStore,
-        dateStr,
-        homeTeamName,
-        awayTeamName,
-        game.gameDate,
-      );
-      if (!match) continue;
-      const [gameId, record] = match;
-      if (record.settled || !record.isLocked) continue;
-      const detailedState = game.status?.detailedState ?? '';
-      if (detailedState.toLowerCase().includes('postponed') || detailedState.toLowerCase().includes('cancelled') || detailedState.toLowerCase().includes('suspended')) continue;
-      if (game.status?.abstractGameState !== "Final") continue;
-      const homeRuns = game.teams?.home?.score ?? 0;
-      const awayRuns = game.teams?.away?.score ?? 0;
-      const totalRuns = homeRuns + awayRuns;
-      if (totalRuns === 0) continue;
-      let result: "WIN" | "LOSS" | "PUSH" = "PUSH";
-      if (record.predictedPlay === "OVER") result = totalRuns > record.total ? "WIN" : totalRuns < record.total ? "LOSS" : "PUSH";
-      else if (record.predictedPlay === "UNDER") result = totalRuns < record.total ? "WIN" : totalRuns > record.total ? "LOSS" : "PUSH";
-      else { record.settled = true; predictionStore.set(gameId, record); continue; }
-      record.settled = true;
-      record.actualRuns = totalRuns;
-      record.result = result;
-      predictionStore.set(gameId, record);
-      anySettled = true;
-      if (result === "WIN") seasonWins++;
-      else if (result === "LOSS") seasonLosses++;
-      else seasonPushes++;
-      console.log(`✅ MLB Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalRuns} — ${result}`);
+    if (mlbSettlementSavePending) {
+      await saveToRedis("MLB");
+      mlbSettlementSavePending = false;
     }
-    if (anySettled) await saveToRedis("MLB");
+    // After a restart, unfinished locked picks still in Redis are eligible for recovery.
+    const dates = new Set([dateStr]);
+    for (const record of predictionStore.values()) {
+      if (record.isLocked && !record.settled
+        && (record.predictedPlay === "OVER" || record.predictedPlay === "UNDER")
+        && /^\d{4}-\d{2}-\d{2}$/.test(record.date) && record.date <= dateStr) {
+        dates.add(record.date);
+      }
+    }
+    for (const settlementDate of Array.from(dates).sort()) {
+      try {
+        console.log(`Settling MLB predictions for ${settlementDate}...`);
+        const res = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${settlementDate}&hydrate=linescore`);
+        const data = await res.json() as any;
+        const games = data?.dates?.[0]?.games || [];
+        for (const game of games) {
+          const homeTeamName = game.teams?.home?.team?.name;
+          const awayTeamName = game.teams?.away?.team?.name;
+          const match = findPredictionForMatch(
+            predictionStore,
+            settlementDate,
+            homeTeamName,
+            awayTeamName,
+            game.gameDate,
+          );
+          if (!match) continue;
+          const [gameId, record] = match;
+          if (record.settled || !record.isLocked) continue;
+          const detailedState = game.status?.detailedState ?? '';
+          if (detailedState.toLowerCase().includes('postponed') || detailedState.toLowerCase().includes('cancelled') || detailedState.toLowerCase().includes('suspended')) continue;
+          if (game.status?.abstractGameState !== "Final") continue;
+          const homeRuns = game.teams?.home?.score ?? 0;
+          const awayRuns = game.teams?.away?.score ?? 0;
+          const totalRuns = homeRuns + awayRuns;
+          if (totalRuns === 0) continue;
+          let result: "WIN" | "LOSS" | "PUSH" = "PUSH";
+          if (record.predictedPlay === "OVER") result = totalRuns > record.total ? "WIN" : totalRuns < record.total ? "LOSS" : "PUSH";
+          else if (record.predictedPlay === "UNDER") result = totalRuns < record.total ? "WIN" : totalRuns > record.total ? "LOSS" : "PUSH";
+          else { record.settled = true; predictionStore.set(gameId, record); continue; }
+          record.settled = true;
+          record.actualRuns = totalRuns;
+          record.result = result;
+          predictionStore.set(gameId, record);
+          mlbSettlementSavePending = true;
+          if (result === "WIN") seasonWins++;
+          else if (result === "LOSS") seasonLosses++;
+          else seasonPushes++;
+          console.log(`✅ MLB Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalRuns} — ${result}`);
+        }
+      } catch (err: any) {
+        console.error(`Error settling MLB predictions for ${settlementDate}:`, err.message);
+      }
+    }
+    if (mlbSettlementSavePending) {
+      await saveToRedis("MLB");
+      mlbSettlementSavePending = false;
+    }
   } catch (err: any) {
     console.error("Error settling MLB predictions:", err.message);
   }

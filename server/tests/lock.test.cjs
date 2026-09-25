@@ -36,11 +36,28 @@ function harness(now, redis = new Map()) {
     }
     static now() { return clock.now; }
   }
-  const responses = { mlb: null, nfl: null };
-  const failures = { get: new Map(), set: new Map() };
+  const responses = { mlb: null, mlbByDate: new Map(), nfl: null };
+  const failures = { get: new Map(), set: new Map(), mset: null };
   const writes = [];
+  const operations = [];
+  const mlbDates = [];
+  const logs = { allowErrors: false, errors: [] };
   const fetch = async (url, options = {}) => {
     const address = String(url);
+    if (address === "https://redis.test") {
+      const [command, predictionsKey, predictions, seasonKey, season] = JSON.parse(options.body);
+      assert.equal(command, "MSET");
+      assert.deepEqual([predictionsKey, seasonKey], ["predictions", "season"]);
+      const failure = failures.mset;
+      if (failure instanceof Error) throw failure;
+      if (failure && !failure.afterCommit) return respond(failure.body ?? { error: "unavailable" }, failure.ok ?? false);
+      redis.set(predictionsKey, predictions);
+      redis.set(seasonKey, season);
+      writes.push(predictionsKey, seasonKey);
+      operations.push("MSET");
+      if (failure) return respond(failure.body ?? { error: "unavailable" }, failure.ok ?? false);
+      return respond({ result: "OK" });
+    }
     if (address.startsWith("https://redis.test/")) {
       const [, action, key] = new URL(address).pathname.split("/");
       const failure = failures[action]?.get(key);
@@ -53,7 +70,16 @@ function harness(now, redis = new Map()) {
         return respond({ result: "OK" });
       }
     }
-    if (address.startsWith("https://statsapi.mlb.com/api/v1/schedule?")) return respond(responses.mlb ?? { dates: [] });
+    if (address.startsWith("https://statsapi.mlb.com/api/v1/schedule?")) {
+      const date = new URL(address).searchParams.get("date");
+      mlbDates.push(date);
+      if (responses.mlbByDate.has(date)) {
+        const response = responses.mlbByDate.get(date);
+        if (response instanceof Error) throw response;
+        return respond(response);
+      }
+      return respond(responses.mlb ?? { dates: [] });
+    }
     if (address === "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard") {
       return respond(responses.nfl ?? { events: [] });
     }
@@ -61,13 +87,19 @@ function harness(now, redis = new Map()) {
   };
   const context = vm.createContext({
     exports: {}, require: createRequire(sourcePath), fetch, Date: ClockDate,
-    Map, Object, Array, Promise, console: { log() {}, error(...args) { throw new Error(args.join(" ")); } },
+    Map, Object, Array, Promise, console: {
+      log() {},
+      error(...args) {
+        logs.errors.push(args.join(" "));
+        if (!logs.allowErrors) throw new Error(args.join(" "));
+      },
+    },
     process: { env: { UPSTASH_REDIS_REST_URL: "https://redis.test", UPSTASH_REDIS_REST_TOKEN: "test" } },
   });
   vm.runInContext(instrumented, context, { filename: sourcePath });
   const api = context.backendUnderTest;
   return {
-    api, redis, responses, failures, writes,
+    api, redis, responses, failures, writes, operations, mlbDates, logs,
     setTime(iso) { clock.now = Date.parse(iso); },
     // Invoke the registered results handlers without opening a real network listener.
     results(route) {
@@ -363,12 +395,15 @@ test("failed Redis writes reject rather than reporting success", async () => {
   const stored = JSON.stringify({ wins: 106, losses: 66, pushes: 0 });
   const h = harness("2026-09-25T12:00:00Z", new Map([["season", stored]]));
   await h.api.loadFromRedis();
-  h.failures.set.set("season", { body: { error: "unavailable" } });
-  await assert.rejects(h.api.saveToRedis("MLB"), /Redis SET season failed: HTTP 503/);
+  h.failures.mset = { body: { error: "unavailable" } };
+  await assert.rejects(h.api.saveToRedis("MLB"), /Redis MLB MSET failed: HTTP 503/);
   assert.equal(h.redis.get("season"), stored);
-  h.failures.set.set("season", { ok: true, body: { error: "rejected" } });
-  await assert.rejects(h.api.saveToRedis("MLB"), /Redis SET season returned an invalid response/);
+  h.failures.mset = { ok: true, body: { error: "rejected" } };
+  await assert.rejects(h.api.saveToRedis("MLB"), /Redis MLB MSET returned an invalid response/);
   assert.equal(h.redis.get("season"), stored);
+  h.failures.mset = null;
+  h.failures.set.set("nfl_season", { body: { error: "unavailable" } });
+  await assert.rejects(h.api.saveToRedis("NFL"), /Redis SET nfl_season failed: HTTP 503/);
 });
 
 test("MLB settlement increments the existing season and persists it once", async () => {
@@ -385,7 +420,110 @@ test("MLB settlement increments the existing season and persists it once", async
   await h.api.settlePredictions();
   await h.api.settlePredictions();
   assert.deepEqual(JSON.parse(h.redis.get("season")), { wins: 107, losses: 66, pushes: 0 });
+  assert.equal(redisRecord(h.redis, "predictions", "existing-season").settled, true);
+  assert.ok(h.operations.every(operation => operation === "MSET"));
   assert.deepEqual([h.api.stats().seasonWins, h.api.stats().seasonLosses], [107, 66]);
+});
+
+test("failed MLB settlement save leaves both stored keys unchanged, then retries without double-counting", async () => {
+  const start = "2026-09-23T18:00:00Z";
+  const h = harness("2026-09-23T17:00:00Z", new Map([
+    ["season", JSON.stringify({ wins: 106, losses: 66, pushes: 0 })],
+  ]));
+  await h.api.loadFromRedis();
+  h.api.upsertPregameDraft(h.api.mlb(), draft("retry-mlb", start, { predictedPlay: "OVER", total: 7.5 }));
+  h.setTime(start);
+  await h.api.lockDuePredictions();
+  const beforePrediction = JSON.stringify(redisRecord(h.redis, "predictions", "retry-mlb"));
+  h.responses.mlb = { dates: [{ games: [mlbFinal(start, 4, 4)] }] };
+  h.setTime("2026-09-24T12:00:00Z");
+  h.failures.mset = { body: { error: "unavailable" } };
+  h.logs.allowErrors = true;
+  await h.api.settlePredictions();
+  assert.match(h.logs.errors.at(-1), /Redis MLB MSET failed: HTTP 503/);
+  assert.equal(h.api.mlb().get("retry-mlb").settled, true);
+  assert.equal(h.api.stats().seasonWins, 107);
+  assert.equal(JSON.stringify(redisRecord(h.redis, "predictions", "retry-mlb")), beforePrediction);
+  assert.deepEqual(JSON.parse(h.redis.get("season")), { wins: 106, losses: 66, pushes: 0 });
+
+  h.failures.mset = null;
+  h.setTime("2026-09-25T12:00:00Z");
+  await h.api.settlePredictions();
+  await h.api.settlePredictions();
+  assert.equal(redisRecord(h.redis, "predictions", "retry-mlb").settled, true);
+  assert.deepEqual(JSON.parse(h.redis.get("season")), { wins: 107, losses: 66, pushes: 0 });
+  assert.equal(h.api.stats().seasonWins, 107);
+});
+
+test("restart after a failed settlement recovers the unresolved locked pick on a later day", async () => {
+  const start = "2026-09-23T18:00:00Z";
+  const first = harness("2026-09-23T17:00:00Z", new Map([
+    ["season", JSON.stringify({ wins: 106, losses: 66, pushes: 0 })],
+  ]));
+  await first.api.loadFromRedis();
+  first.api.upsertPregameDraft(first.api.mlb(), draft("restart-mlb", start, { predictedPlay: "OVER", total: 7.5 }));
+  first.setTime(start);
+  await first.api.lockDuePredictions();
+  first.responses.mlb = { dates: [{ games: [mlbFinal(start, 4, 4)] }] };
+  first.setTime("2026-09-24T12:00:00Z");
+  first.failures.mset = { body: { error: "unavailable" } };
+  first.logs.allowErrors = true;
+  await first.api.settlePredictions();
+
+  const restarted = harness("2026-09-27T12:00:00Z", first.redis);
+  await restarted.api.loadFromRedis();
+  assert.equal(restarted.api.mlb().get("restart-mlb").settled, false);
+  assert.deepEqual([restarted.api.stats().seasonWins, restarted.api.stats().seasonLosses], [106, 66]);
+  restarted.responses.mlb = { dates: [{ games: [mlbFinal(start, 4, 4)] }] };
+  await restarted.api.settlePredictions();
+  assert.ok(restarted.mlbDates.includes("2026-09-23"));
+  assert.equal(redisRecord(first.redis, "predictions", "restart-mlb").settled, true);
+  assert.deepEqual(JSON.parse(first.redis.get("season")), { wins: 107, losses: 66, pushes: 0 });
+  await restarted.api.settlePredictions();
+  assert.equal(restarted.api.stats().seasonWins, 107);
+});
+
+test("failure fetching an old unfinished date does not block newer MLB settlement", async () => {
+  const oldStart = "2026-09-21T18:00:00Z";
+  const recentStart = "2026-09-23T18:00:00Z";
+  const h = harness("2026-09-24T12:00:00Z", new Map([
+    ["season", JSON.stringify({ wins: 106, losses: 66, pushes: 0 })],
+    ["predictions", JSON.stringify({
+      old: draft("old", oldStart, { isLocked: true, lockedAt: oldStart }),
+      recent: draft("recent", recentStart, { isLocked: true, lockedAt: recentStart, predictedPlay: "OVER", total: 7.5 }),
+    })],
+  ]));
+  await h.api.loadFromRedis();
+  h.responses.mlbByDate.set("2026-09-21", new Error("schedule unavailable"));
+  h.responses.mlbByDate.set("2026-09-23", { dates: [{ games: [mlbFinal(recentStart, 4, 4)] }] });
+  h.logs.allowErrors = true;
+  await h.api.settlePredictions();
+  assert.deepEqual(h.mlbDates, ["2026-09-21", "2026-09-23"]);
+  assert.equal(redisRecord(h.redis, "predictions", "old").settled, false);
+  assert.equal(redisRecord(h.redis, "predictions", "recent").settled, true);
+  assert.deepEqual(JSON.parse(h.redis.get("season")), { wins: 107, losses: 66, pushes: 0 });
+});
+
+test("a lost response after an atomic MLB commit cannot duplicate the result after restart", async () => {
+  const start = "2026-09-23T18:00:00Z";
+  const h = harness("2026-09-23T17:00:00Z", new Map([
+    ["season", JSON.stringify({ wins: 106, losses: 66, pushes: 0 })],
+  ]));
+  await h.api.loadFromRedis();
+  h.api.upsertPregameDraft(h.api.mlb(), draft("ambiguous-mlb", start, { predictedPlay: "OVER", total: 7.5 }));
+  h.setTime(start);
+  await h.api.lockDuePredictions();
+  h.responses.mlb = { dates: [{ games: [mlbFinal(start, 4, 4)] }] };
+  h.setTime("2026-09-24T12:00:00Z");
+  h.failures.mset = { afterCommit: true, body: { error: "response lost" } };
+  h.logs.allowErrors = true;
+  await h.api.settlePredictions();
+  const restarted = harness("2026-09-27T12:00:00Z", h.redis);
+  await restarted.api.loadFromRedis();
+  restarted.responses.mlb = h.responses.mlb;
+  await restarted.api.settlePredictions();
+  assert.equal(restarted.api.stats().seasonWins, 107);
+  assert.equal(redisRecord(h.redis, "predictions", "ambiguous-mlb").settled, true);
 });
 
 test("NFL locking and settlement never write the MLB season key", async () => {
