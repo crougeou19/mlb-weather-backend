@@ -209,11 +209,25 @@ async function loadFromRedis() {
   seasonReady = false;
   console.log("Loading data from Redis...");
   const predictions = await redisGet("predictions");
-  const season = await redisGet("season");
+  const storedSeason = await redisGet("season");
+  let season = storedSeason;
   const nflPredictions = await redisGet("nfl_predictions");
   const nflSeason = await redisGet("nfl_season");
-  if (season !== null && (
-    typeof season !== "object" || Array.isArray(season)
+  // Earlier REST writes stored a JSON object with a single string-valued "value" field.
+  if (storedSeason !== null && typeof storedSeason === "object" && !Array.isArray(storedSeason)
+    && Object.keys(storedSeason).length === 1
+    && Object.prototype.hasOwnProperty.call(storedSeason, "value")) {
+    if (typeof storedSeason.value !== "string") {
+      throw new Error("Redis season record is invalid; refusing to replace it");
+    }
+    try {
+      season = JSON.parse(storedSeason.value);
+    } catch {
+      throw new Error("Redis season record is invalid; refusing to replace it");
+    }
+  }
+  if (storedSeason !== null && (
+    season === null || typeof season !== "object" || Array.isArray(season)
     || !Number.isSafeInteger(season.wins) || season.wins < 0
     || !Number.isSafeInteger(season.losses) || season.losses < 0
     || (season.pushes !== undefined && (!Number.isSafeInteger(season.pushes) || season.pushes < 0))
