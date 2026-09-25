@@ -350,6 +350,40 @@ test("valid existing MLB season loads without changing its Redis value", async (
   assert.deepEqual(h.writes, []);
 });
 
+test("legacy wrapped MLB season loads exact counters without a write, then saves normalized", async () => {
+  const stored = JSON.stringify({ value: JSON.stringify({ wins: 106, losses: 66, pushes: 0 }) });
+  const h = harness("2026-09-25T12:00:00Z", new Map([["season", stored]]));
+  await h.api.loadFromRedis();
+  assert.deepEqual(
+    [h.api.stats().seasonWins, h.api.stats().seasonLosses, h.api.stats().seasonPushes],
+    [106, 66, 0],
+  );
+  assert.equal(h.redis.get("season"), stored);
+  assert.deepEqual(h.writes, []);
+  await h.api.saveToRedis("MLB");
+  assert.deepEqual(JSON.parse(h.redis.get("season")), { wins: 106, losses: 66, pushes: 0 });
+  assert.deepEqual(h.operations, ["MSET"]);
+});
+
+test("malformed legacy wrappers cannot initialize or overwrite the MLB season", async () => {
+  const invalid = [
+    { value: "not JSON" },
+    { value: "null" },
+    { value: JSON.stringify({ wins: "106", losses: 66 }) },
+    { value: JSON.stringify({ wins: -1, losses: 66 }) },
+    { value: JSON.stringify([106, 66, 0]) },
+    { value: JSON.stringify({ wins: 106, losses: 66 }), extra: true },
+  ];
+  for (const record of invalid) {
+    const stored = JSON.stringify(record);
+    const h = harness("2026-09-25T12:00:00Z", new Map([["season", stored]]));
+    await assert.rejects(h.api.loadFromRedis(), /Redis season record is invalid/);
+    await assert.rejects(h.api.saveToRedis("MLB"), /Cannot save MLB season/);
+    assert.equal(h.redis.get("season"), stored);
+    assert.deepEqual(h.writes, []);
+  }
+});
+
 test("a genuinely absent season initializes at zero, never at the old fallback", async () => {
   const h = harness("2026-09-25T12:00:00Z");
   await h.api.loadFromRedis();
