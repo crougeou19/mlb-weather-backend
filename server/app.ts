@@ -223,6 +223,8 @@ async function loadFromRedis() {
       winsType: typeof season?.wins, winsSafeInteger: Number.isSafeInteger(season?.wins),
       lossesType: typeof season?.losses, lossesSafeInteger: Number.isSafeInteger(season?.losses),
       pushesType: typeof season?.pushes, pushesSafeInteger: season?.pushes === undefined || Number.isSafeInteger(season?.pushes),
+      hasValueWrapper: Object.prototype.hasOwnProperty.call(season, "value"), valueWrapperType: typeof season?.value,
+      hasResultWrapper: Object.prototype.hasOwnProperty.call(season, "result"), resultWrapperType: typeof season?.result,
     });
     throw new Error("Redis season record is invalid; refusing to replace it");
   }
