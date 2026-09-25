@@ -13,30 +13,32 @@ const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
 async function redisGet(key: string): Promise<any> {
-  try {
-    const res = await fetch(`${REDIS_URL}/get/${key}`, {
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
-    });
-    const data = await res.json() as any;
-    return data.result ? JSON.parse(data.result) : null;
-  } catch (e) {
-    return null;
+  const res = await fetch(`${REDIS_URL}/get/${key}`, {
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+  });
+  if (!res.ok) throw new Error(`Redis GET ${key} failed: HTTP ${res.status}`);
+  const data = await res.json() as any;
+  if (!data || data.error || !Object.prototype.hasOwnProperty.call(data, "result")) {
+    throw new Error(`Redis GET ${key} returned an invalid response`);
   }
+  if (data.result === null) return null;
+  const value = JSON.parse(data.result);
+  if (value === null) throw new Error(`Redis GET ${key} contains a stored null value`);
+  return value;
 }
 
 async function redisSet(key: string, value: any): Promise<void> {
-  try {
-    await fetch(`${REDIS_URL}/set/${key}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${REDIS_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ value: JSON.stringify(value) }),
-    });
-  } catch (e) {
-    console.error("Redis set error:", e);
-  }
+  const res = await fetch(`${REDIS_URL}/set/${key}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${REDIS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ value: JSON.stringify(value) }),
+  });
+  if (!res.ok) throw new Error(`Redis SET ${key} failed: HTTP ${res.status}`);
+  const data = await res.json() as any;
+  if (data?.result !== "OK") throw new Error(`Redis SET ${key} returned an invalid response`);
 }
 
 interface PredictionRecord {
@@ -89,6 +91,7 @@ let predictionStore: Map<string, PredictionRecord> = new Map();
 let seasonWins = 0;
 let seasonLosses = 0;
 let seasonPushes = 0;
+let seasonReady = false;
 
 let nflPredictionStore: Map<string, NFLPredictionRecord> = new Map();
 let nflSeasonWins = 0;
@@ -157,7 +160,7 @@ function upsertPregameDraft<T extends AnyPredictionRecord>(
 async function lockDuePredictions(): Promise<void> {
   const now = Date.now();
   const lockRecordedAt = new Date(now).toISOString();
-  let changed = false;
+  const changedSports = new Set<"MLB" | "NFL">();
 
   for (const [sport, store] of [
     ["MLB", predictionStore],
@@ -170,7 +173,7 @@ async function lockDuePredictions(): Promise<void> {
 
       const lockedAt = new Date(commenceMs).toISOString();
       store.set(gameId, { ...record, isLocked: true, lockedAt, lockRecordedAt });
-      changed = true;
+      changedSports.add(sport);
       console.log(
         `🔒 ${sport} official pick locked: ${record.awayTeam} @ ${record.homeTeam}`
         + ` — ${record.predictedPlay} ${record.total} — ${record.confidence}`
@@ -179,73 +182,74 @@ async function lockDuePredictions(): Promise<void> {
     }
   }
 
-  if (changed) await saveToRedis();
+  for (const sport of changedSports) await saveToRedis(sport);
 }
 
 async function loadFromRedis() {
-  try {
-    console.log("Loading data from Redis...");
-    const predictions = await redisGet("predictions");
-    const season = await redisGet("season");
-    if (predictions) {
-      predictionStore = new Map(Object.entries(predictions));
-      console.log(`Loaded ${predictionStore.size} predictions from Redis`);
-    }
-    if (season && typeof season.wins === "number") {
-      seasonWins = season.wins;
-      seasonLosses = season.losses ?? 0;
-      seasonPushes = season.pushes ?? 0;
-      console.log(`Using saved season record: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
-    } else {
-      seasonWins = 104;
-      seasonLosses = 59;
-      seasonPushes = 0;
-      console.log("No saved season found — using fallback backup");
-    }
-    const nflPredictions = await redisGet("nfl_predictions");
-    const nflSeason = await redisGet("nfl_season");
-    if (nflPredictions) {
-      nflPredictionStore = new Map(Object.entries(nflPredictions));
-      console.log(`Loaded ${nflPredictionStore.size} NFL predictions from Redis`);
-    }
-    if (nflSeason && typeof nflSeason.wins === "number") {
-      nflSeasonWins = nflSeason.wins;
-      nflSeasonLosses = nflSeason.losses ?? 0;
-      nflSeasonPushes = nflSeason.pushes ?? 0;
-      console.log(`NFL season record: ${nflSeasonWins}W-${nflSeasonLosses}L-${nflSeasonPushes}P`);
-    }
-  } catch (e) {
-    console.error("Failed to load from Redis:", e);
-    seasonWins = 104;
-    seasonLosses = 59;
-    seasonPushes = 0;
+  seasonReady = false;
+  console.log("Loading data from Redis...");
+  const predictions = await redisGet("predictions");
+  const season = await redisGet("season");
+  const nflPredictions = await redisGet("nfl_predictions");
+  const nflSeason = await redisGet("nfl_season");
+  if (season !== null && (
+    typeof season !== "object" || Array.isArray(season)
+    || !Number.isSafeInteger(season.wins) || season.wins < 0
+    || !Number.isSafeInteger(season.losses) || season.losses < 0
+    || (season.pushes !== undefined && (!Number.isSafeInteger(season.pushes) || season.pushes < 0))
+  )) {
+    throw new Error("Redis season record is invalid; refusing to replace it");
   }
+  if (predictions) {
+    predictionStore = new Map(Object.entries(predictions));
+    console.log(`Loaded ${predictionStore.size} predictions from Redis`);
+  }
+  if (season !== null) {
+    seasonWins = season.wins;
+    seasonLosses = season.losses;
+    seasonPushes = season.pushes ?? 0;
+    console.log(`Using saved season record: ${seasonWins}W-${seasonLosses}L-${seasonPushes}P`);
+  } else {
+    seasonWins = 0;
+    seasonLosses = 0;
+    seasonPushes = 0;
+    console.log("No season record exists in Redis; initializing new 0W-0L-0P season");
+  }
+  if (nflPredictions) {
+    nflPredictionStore = new Map(Object.entries(nflPredictions));
+    console.log(`Loaded ${nflPredictionStore.size} NFL predictions from Redis`);
+  }
+  if (nflSeason && typeof nflSeason.wins === "number") {
+    nflSeasonWins = nflSeason.wins;
+    nflSeasonLosses = nflSeason.losses ?? 0;
+    nflSeasonPushes = nflSeason.pushes ?? 0;
+    console.log(`NFL season record: ${nflSeasonWins}W-${nflSeasonLosses}L-${nflSeasonPushes}P`);
+  }
+  seasonReady = true;
 }
 
 let redisSaveQueue: Promise<void> = Promise.resolve();
 
-function saveToRedis(): Promise<void> {
+function saveToRedis(sport: "MLB" | "NFL" | "BOTH" = "BOTH"): Promise<void> {
   redisSaveQueue = redisSaveQueue
     .catch(() => {})
-    .then(saveToRedisNow);
+    .then(() => saveToRedisNow(sport));
   return redisSaveQueue;
 }
 
-async function saveToRedisNow() {
-  try {
+async function saveToRedisNow(sport: "MLB" | "NFL" | "BOTH") {
+  if (sport !== "NFL") {
+    if (!seasonReady) throw new Error("Cannot save MLB season before a successful Redis load");
     const predictionsObj = Object.fromEntries(predictionStore);
     await redisSet("predictions", predictionsObj);
-    const totalGames = seasonWins + seasonLosses + seasonPushes;
-    if (totalGames > 0) {
-      await redisSet("season", { wins: seasonWins, losses: seasonLosses, pushes: seasonPushes });
-      console.log(`✅ Saved MLB season record: ${seasonWins}-${seasonLosses}-${seasonPushes}`);
-    }
+    await redisSet("season", { wins: seasonWins, losses: seasonLosses, pushes: seasonPushes });
+    console.log(`✅ Saved MLB season record: ${seasonWins}-${seasonLosses}-${seasonPushes}`);
+  }
+  if (sport !== "MLB") {
     const nflPredictionsObj = Object.fromEntries(nflPredictionStore);
     await redisSet("nfl_predictions", nflPredictionsObj);
     await redisSet("nfl_season", { wins: nflSeasonWins, losses: nflSeasonLosses, pushes: nflSeasonPushes });
     console.log(`✅ Saved NFL season record: ${nflSeasonWins}-${nflSeasonLosses}-${nflSeasonPushes}`);
-  } catch (e) {
-    console.error("Failed to save to Redis:", e);
   }
 }
 
@@ -293,7 +297,7 @@ async function settlePredictions() {
       else seasonPushes++;
       console.log(`✅ MLB Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalRuns} — ${result}`);
     }
-    if (anySettled) await saveToRedis();
+    if (anySettled) await saveToRedis("MLB");
   } catch (err: any) {
     console.error("Error settling MLB predictions:", err.message);
   }
@@ -347,7 +351,7 @@ async function settleNFLPredictions() {
       else nflSeasonPushes++;
       console.log(`✅ NFL Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalScore} — ${result}`);
     }
-    if (anySettled) await saveToRedis();
+    if (anySettled) await saveToRedis("NFL");
   } catch (err: any) {
     console.error("NFL settlement error:", err.message);
   }
@@ -1203,7 +1207,7 @@ app.get("/nfl-games", async (req, res) => {
       };
     }));
 
-    if (nflPredictionsChanged) await saveToRedis();
+    if (nflPredictionsChanged) await saveToRedis("NFL");
     res.json(games);
   } catch (err: any) {
     res.status(500).json({ error: "Failed to fetch NFL games", details: err.message });
@@ -1525,7 +1529,7 @@ async function fetchGames() {
       },
     };
   }));
-  if (predictionsChanged) await saveToRedis();
+  if (predictionsChanged) await saveToRedis("MLB");
   return results;
 }
 
@@ -1586,7 +1590,10 @@ async function startup() {
   scheduleSettlement();
 }
 
-startup();
+startup().catch(err => {
+  console.error("Backend startup failed; refusing to run without Redis data:", err);
+  process.exit(1);
+});
 
 app.get("/force-save-season", async (req, res) => {
   try {
