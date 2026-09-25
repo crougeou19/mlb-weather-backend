@@ -218,6 +218,12 @@ async function loadFromRedis() {
     || !Number.isSafeInteger(season.losses) || season.losses < 0
     || (season.pushes !== undefined && (!Number.isSafeInteger(season.pushes) || season.pushes < 0))
   )) {
+    console.error("Redis season rejected (types only):", {
+      recordType: typeof season, isArray: Array.isArray(season),
+      winsType: typeof season?.wins, winsSafeInteger: Number.isSafeInteger(season?.wins),
+      lossesType: typeof season?.losses, lossesSafeInteger: Number.isSafeInteger(season?.losses),
+      pushesType: typeof season?.pushes, pushesSafeInteger: season?.pushes === undefined || Number.isSafeInteger(season?.pushes),
+    });
     throw new Error("Redis season record is invalid; refusing to replace it");
   }
   if (predictions) {
