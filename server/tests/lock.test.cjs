@@ -365,6 +365,40 @@ test("legacy wrapped MLB season loads exact counters without a write, then saves
   assert.deepEqual(h.operations, ["MSET"]);
 });
 
+test("legacy wrapped predictions restore every record and save with the unchanged season", async () => {
+  const start = "2026-09-25T18:00:00Z";
+  const predictions = Object.fromEntries(
+    Array.from({ length: 61 }, (_, i) => [`mlb-${i}`, draft(`mlb-${i}`, start)]),
+  );
+  const storedPredictions = JSON.stringify({ value: JSON.stringify(predictions) });
+  const storedSeason = JSON.stringify({ value: JSON.stringify({ wins: 106, losses: 66, pushes: 0 }) });
+  const h = harness("2026-09-25T12:00:00Z", new Map([
+    ["predictions", storedPredictions], ["season", storedSeason],
+  ]));
+  await h.api.loadFromRedis();
+  assert.equal(h.api.mlb().size, 61);
+  assert.equal(h.api.mlb().has("value"), false);
+  assert.deepEqual([h.api.stats().seasonWins, h.api.stats().seasonLosses], [106, 66]);
+  assert.equal(h.redis.get("predictions"), storedPredictions);
+  assert.deepEqual(h.writes, []);
+  await h.api.saveToRedis("MLB");
+  assert.equal(Object.keys(JSON.parse(h.redis.get("predictions"))).length, 61);
+  assert.equal(JSON.parse(h.redis.get("predictions"))["mlb-0"].gameId, "mlb-0");
+  assert.deepEqual(JSON.parse(h.redis.get("season")), { wins: 106, losses: 66, pushes: 0 });
+  assert.deepEqual(h.operations, ["MSET"]);
+});
+
+test("malformed legacy predictions cannot be overwritten", async () => {
+  for (const value of ["not JSON", "null", JSON.stringify([])]) {
+    const stored = JSON.stringify({ value });
+    const h = harness("2026-09-25T12:00:00Z", new Map([["predictions", stored]]));
+    await assert.rejects(h.api.loadFromRedis(), /Redis predictions record is invalid/);
+    await assert.rejects(h.api.saveToRedis("MLB"), /Cannot save MLB season/);
+    assert.equal(h.redis.get("predictions"), stored);
+    assert.deepEqual(h.writes, []);
+  }
+});
+
 test("malformed legacy wrappers cannot initialize or overwrite the MLB season", async () => {
   const invalid = [
     { value: "not JSON" },
