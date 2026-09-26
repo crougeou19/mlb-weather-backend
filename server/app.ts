@@ -11,6 +11,76 @@ let lastCacheTime: number = 0;
 
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const MLB_OFFICIAL_HASH = "mlb_official_v1";
+const MLB_DRAFT_HASH = "mlb_drafts_v1";
+
+async function redisCommand(command: unknown[], label: string): Promise<any> {
+  const res = await fetch(`${REDIS_URL}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${REDIS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(command),
+  });
+  if (!res.ok) throw new Error(`${label} failed: HTTP ${res.status}`);
+  const data = await res.json() as any;
+  if (!data || data.error || !Object.prototype.hasOwnProperty.call(data, "result")) {
+    throw new Error(`${label} returned an invalid response`);
+  }
+  return data.result;
+}
+
+// Prevalidate before the first write: Redis scripts are atomic to other clients,
+// but a script error after a write does not roll that write back.
+const GRADE_MLB_SCRIPT = `
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then return redis.error_reply('official MLB record missing') end
+local record = cjson.decode(raw)
+if record.settled then return {0, raw, redis.call('GET', KEYS[2]) or ''} end
+if record.isLocked ~= true or record.mlbGamePk ~= tonumber(ARGV[1]) then
+  return redis.error_reply('official MLB record invalid')
+end
+if record.predictedPlay ~= 'OVER' and record.predictedPlay ~= 'UNDER' then
+  return redis.error_reply('official MLB play invalid')
+end
+local seasonRaw = redis.call('GET', KEYS[2])
+if not seasonRaw then seasonRaw = '{"wins":0,"losses":0,"pushes":0}' end
+local season = cjson.decode(seasonRaw)
+if season.value and type(season.value) == 'string' then season = cjson.decode(season.value) end
+if season.pushes == nil then season.pushes = 0 end
+if type(season.wins) ~= 'number' or type(season.losses) ~= 'number'
+  or type(season.pushes) ~= 'number' then return redis.error_reply('MLB season invalid') end
+local grade = ARGV[2]
+if grade ~= 'WIN' and grade ~= 'LOSS' and grade ~= 'PUSH' then
+  return redis.error_reply('MLB grade invalid')
+end
+local runs = tonumber(ARGV[3])
+if not runs or runs <= 0 then return redis.error_reply('MLB runs invalid') end
+record.settled = true
+record.result = grade
+record.actualRuns = runs
+record.settledAt = ARGV[4]
+if grade == 'WIN' then season.wins = season.wins + 1
+elseif grade == 'LOSS' then season.losses = season.losses + 1
+else season.pushes = season.pushes + 1 end
+local updated = cjson.encode(record)
+local updatedSeason = cjson.encode(season)
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+redis.call('SET', KEYS[2], updatedSeason)
+return {1, updated, updatedSeason}
+`;
+
+const SAVE_MLB_DRAFT_SCRIPT = `
+local previous = redis.call('HGET', KEYS[1], ARGV[1])
+if previous then
+  local record = cjson.decode(previous)
+  if type(record.draftUpdatedAt) == 'number'
+    and record.draftUpdatedAt > tonumber(ARGV[3]) then return 0 end
+end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+return 1
+`;
 
 async function redisGet(key: string): Promise<any> {
   const res = await fetch(`${REDIS_URL}/get/${key}`, {
@@ -41,27 +111,10 @@ async function redisSet(key: string, value: any): Promise<void> {
   if (data?.result !== "OK") throw new Error(`Redis SET ${key} returned an invalid response`);
 }
 
-async function redisSaveMlb(predictions: Record<string, PredictionRecord>): Promise<void> {
-  // One Redis command prevents a settled prediction from being durable without its season count.
-  const res = await fetch(`${REDIS_URL}`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${REDIS_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify([
-      "MSET",
-      "predictions", JSON.stringify(predictions),
-      "season", JSON.stringify({ wins: seasonWins, losses: seasonLosses, pushes: seasonPushes }),
-    ]),
-  });
-  if (!res.ok) throw new Error(`Redis MLB MSET failed: HTTP ${res.status}`);
-  const data = await res.json() as any;
-  if (data?.result !== "OK") throw new Error("Redis MLB MSET returned an invalid response");
-}
-
 interface PredictionRecord {
   gameId: string;
+  mlbGamePk?: number;
+  draftUpdatedAt?: number;
   date: string;
   homeTeam: string;
   awayTeam: string;
@@ -80,6 +133,7 @@ interface PredictionRecord {
   settled: boolean;
   actualRuns?: number;
   result?: "WIN" | "LOSS" | "PUSH";
+  settledAt?: string;
 }
 
 interface NFLPredictionRecord {
@@ -107,11 +161,11 @@ interface NFLPredictionRecord {
 }
 
 let predictionStore: Map<string, PredictionRecord> = new Map();
+let officialMlbStore: Map<number, PredictionRecord> = new Map();
 let seasonWins = 0;
 let seasonLosses = 0;
 let seasonPushes = 0;
 let seasonReady = false;
-let mlbSettlementSavePending = false;
 
 let nflPredictionStore: Map<string, NFLPredictionRecord> = new Map();
 let nflSeasonWins = 0;
@@ -166,6 +220,7 @@ function upsertPregameDraft<T extends AnyPredictionRecord>(
 
   store.set(snapshot.gameId, {
     ...snapshot,
+    draftUpdatedAt: Date.now(),
     isLocked: false,
     lockedAt: undefined,
     lockRecordedAt: undefined,
@@ -177,32 +232,155 @@ function upsertPregameDraft<T extends AnyPredictionRecord>(
   return true;
 }
 
+function validateOfficialMlb(value: any, gamePk: number): PredictionRecord {
+  if (!value || typeof value !== "object" || value.mlbGamePk !== gamePk
+    || typeof value.gameId !== "string" || typeof value.date !== "string"
+    || typeof value.homeTeam !== "string" || typeof value.awayTeam !== "string"
+    || !value.isLocked || !value.lockedAt || !value.commenceTime
+    || !Number.isFinite(value.total)) {
+    throw new Error(`Invalid official MLB record for game ${gamePk}`);
+  }
+  return value as PredictionRecord;
+}
+
+async function readOfficialMlb(gamePk: number): Promise<PredictionRecord | null> {
+  const raw = await redisCommand(["HGET", MLB_OFFICIAL_HASH, String(gamePk)], "Redis MLB HGET");
+  return raw === null ? null : validateOfficialMlb(JSON.parse(raw), gamePk);
+}
+
+async function scanRedisHash(key: string): Promise<Array<[string, string]>> {
+  const entries: Array<[string, string]> = [];
+  let cursor = "0";
+  do {
+    const page = await redisCommand(["HSCAN", key, cursor, "COUNT", "100"], `Redis ${key} HSCAN`);
+    if (!Array.isArray(page) || page.length !== 2 || !Array.isArray(page[1]) || page[1].length % 2) {
+      throw new Error(`Redis ${key} scan returned an invalid response`);
+    }
+    cursor = String(page[0]);
+    for (let i = 0; i < page[1].length; i += 2) entries.push([page[1][i], page[1][i + 1]]);
+  } while (cursor !== "0");
+  return entries;
+}
+
+async function loadMlbDrafts(): Promise<void> {
+  const entries = await scanRedisHash(MLB_DRAFT_HASH);
+  for (const [field, raw] of entries) {
+    const gamePk = Number(field);
+    const draft = JSON.parse(raw) as PredictionRecord;
+    if (!Number.isSafeInteger(gamePk) || gamePk <= 0 || draft.mlbGamePk !== gamePk
+      || typeof draft.gameId !== "string" || !draft.commenceTime || !draft.homeTeam || !draft.awayTeam
+      || draft.isLocked || draft.lockedAt) {
+      throw new Error(`Invalid MLB draft for game ${field}`);
+    }
+    if (officialMlbStore.has(gamePk)) continue;
+    for (const [oldId, old] of predictionStore) {
+      if (oldId !== draft.gameId && old.mlbGamePk === gamePk && !old.isLocked && !old.lockedAt) {
+        predictionStore.delete(oldId);
+      }
+    }
+    if (!predictionStore.get(draft.gameId)?.isLocked) predictionStore.set(draft.gameId, draft);
+  }
+  console.log(`Loaded ${entries.length} verified MLB drafts from Redis`);
+}
+
+async function loadOfficialMlb(): Promise<void> {
+  const records = new Map<number, PredictionRecord>();
+  for (const [field, raw] of await scanRedisHash(MLB_OFFICIAL_HASH)) {
+    const gamePk = Number(field);
+    if (!Number.isSafeInteger(gamePk) || gamePk <= 0) throw new Error("Invalid MLB official hash entry");
+    const record = validateOfficialMlb(JSON.parse(raw), gamePk);
+    records.set(gamePk, record);
+  }
+  officialMlbStore = records;
+  for (const [id, draft] of predictionStore) {
+    const confirmed = draft.mlbGamePk && records.get(draft.mlbGamePk);
+    if (confirmed && id !== confirmed.gameId && !draft.isLocked && !draft.lockedAt) {
+      predictionStore.delete(id);
+    }
+  }
+  for (const record of records.values()) predictionStore.set(record.gameId, record);
+  console.log(`Loaded ${records.size} confirmed MLB locks from Redis`);
+}
+
+async function persistOfficialMlb(record: PredictionRecord): Promise<PredictionRecord> {
+  const gamePk = record.mlbGamePk;
+  if (!Number.isSafeInteger(gamePk) || !gamePk || gamePk <= 0) {
+    throw new Error(`Cannot lock MLB prediction ${record.gameId}: unverified MLB game ID`);
+  }
+  try {
+    const written = await redisCommand(
+      ["HSETNX", MLB_OFFICIAL_HASH, String(gamePk), JSON.stringify(record)],
+      "Redis MLB lock HSETNX",
+    );
+    if (written !== 0 && written !== 1) throw new Error("Redis MLB lock returned an invalid response");
+  } catch (error) {
+    // An HTTP failure may have happened *after* Redis committed. Never claim a
+    // failed lock or issue a second snapshot until its individual key is checked.
+    const persisted = await readOfficialMlb(gamePk);
+    if (!persisted || persisted.gameId !== record.gameId
+      || persisted.homeTeam !== record.homeTeam || persisted.awayTeam !== record.awayTeam) throw error;
+    return persisted;
+  }
+  const persisted = await readOfficialMlb(gamePk);
+  if (!persisted || persisted.gameId !== record.gameId
+    || persisted.homeTeam !== record.homeTeam || persisted.awayTeam !== record.awayTeam) {
+    throw new Error(`Redis MLB lock readback failed for game ${gamePk}`);
+  }
+  return persisted;
+}
+
 async function lockDuePredictions(): Promise<void> {
+  // Other instances may have written drafts since this instance started.
+  // Refresh before checking kickoff, including a newly revised start time.
+  await loadMlbDrafts();
   const now = Date.now();
   const lockRecordedAt = new Date(now).toISOString();
   const changedSports = new Set<"MLB" | "NFL">();
 
-  for (const [sport, store] of [
-    ["MLB", predictionStore],
-    ["NFL", nflPredictionStore],
-  ] as const) {
-    for (const [gameId, record] of store.entries()) {
-      if (record.isLocked || record.lockedAt || !record.commenceTime) continue;
-      const commenceMs = new Date(record.commenceTime).getTime();
-      if (!Number.isFinite(commenceMs) || commenceMs > now) continue;
-
-      const lockedAt = new Date(commenceMs).toISOString();
-      store.set(gameId, { ...record, isLocked: true, lockedAt, lockRecordedAt });
-      changedSports.add(sport);
+  for (const [gameId, record] of predictionStore.entries()) {
+    if (record.isLocked || record.lockedAt || !record.commenceTime) continue;
+    const commenceMs = new Date(record.commenceTime).getTime();
+    if (!Number.isFinite(commenceMs) || commenceMs > now) continue;
+    try {
+      const raw = Number.isSafeInteger(record.mlbGamePk)
+        ? await redisCommand(["HGET", MLB_DRAFT_HASH, String(record.mlbGamePk)], "Redis MLB draft HGET") : null;
+      const latest = raw ? JSON.parse(raw) as PredictionRecord : record;
+      if (latest.mlbGamePk !== record.mlbGamePk
+        || latest.homeTeam !== record.homeTeam || latest.awayTeam !== record.awayTeam) {
+        throw new Error("Verified MLB draft identity changed");
+      }
+      const latestStart = Date.parse(latest.commenceTime ?? "");
+      if (!Number.isFinite(latestStart) || latestStart > now) continue;
+      const snapshot = {
+        ...latest, isLocked: true, lockedAt: new Date(latestStart).toISOString(), lockRecordedAt,
+      };
+      const persisted = await persistOfficialMlb(snapshot);
+      officialMlbStore.set(persisted.mlbGamePk!, persisted);
+      predictionStore.set(persisted.gameId, persisted);
+      if (persisted.gameId !== gameId) predictionStore.delete(gameId);
+      // A pregame /games response must not remain cached past the official lock.
+      cachedGames = null;
+      lastCacheTime = 0;
       console.log(
-        `🔒 ${sport} official pick locked: ${record.awayTeam} @ ${record.homeTeam}`
-        + ` — ${record.predictedPlay} ${record.total} — ${record.confidence}`
-        + ` — effective ${lockedAt} — recorded ${lockRecordedAt}`,
+        `🔒 MLB official pick locked: ${persisted.awayTeam} @ ${persisted.homeTeam}`
+        + ` — ${persisted.predictedPlay} ${persisted.total} — ${persisted.confidence}`
+        + ` — gamePk ${persisted.mlbGamePk} — effective ${persisted.lockedAt}`
+        + ` — confirmed ${new Date().toISOString()}`,
       );
+    } catch (err: any) {
+      console.error(`MLB lock persistence failed: gameId=${gameId} gamePk=${record.mlbGamePk ?? "unbound"}: ${err.message}`);
     }
   }
-
-  for (const sport of changedSports) await saveToRedis(sport);
+  for (const [gameId, record] of nflPredictionStore.entries()) {
+    if (record.isLocked || record.lockedAt || !record.commenceTime) continue;
+    const commenceMs = new Date(record.commenceTime).getTime();
+    if (!Number.isFinite(commenceMs) || commenceMs > now) continue;
+    const lockedAt = new Date(commenceMs).toISOString();
+    nflPredictionStore.set(gameId, { ...record, isLocked: true, lockedAt, lockRecordedAt });
+    changedSports.add("NFL");
+    console.log(`🔒 NFL official pick locked: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — ${record.confidence} — effective ${lockedAt} — recorded ${lockRecordedAt}`);
+  }
+  if (changedSports.has("NFL")) await saveToRedis("NFL");
 }
 
 async function loadFromRedis() {
@@ -275,23 +453,43 @@ async function loadFromRedis() {
     nflSeasonPushes = nflSeason.pushes ?? 0;
     console.log(`NFL season record: ${nflSeasonWins}W-${nflSeasonLosses}L-${nflSeasonPushes}P`);
   }
+  await loadMlbDrafts();
+  await loadOfficialMlb();
   seasonReady = true;
 }
 
 let redisSaveQueue: Promise<void> = Promise.resolve();
 
+function queueRedisAction<T>(action: () => Promise<T>): Promise<T> {
+  const next = redisSaveQueue.catch(() => {}).then(action);
+  redisSaveQueue = next.then(() => {}, () => {});
+  return next;
+}
+
 function saveToRedis(sport: "MLB" | "NFL" | "BOTH" = "BOTH"): Promise<void> {
-  redisSaveQueue = redisSaveQueue
-    .catch(() => {})
-    .then(() => saveToRedisNow(sport));
-  return redisSaveQueue;
+  return queueRedisAction(() => saveToRedisNow(sport));
 }
 
 async function saveToRedisNow(sport: "MLB" | "NFL" | "BOTH") {
   if (sport !== "NFL") {
     if (!seasonReady) throw new Error("Cannot save MLB season before a successful Redis load");
-    await redisSaveMlb(Object.fromEntries(predictionStore));
-    console.log(`✅ Saved MLB season record: ${seasonWins}-${seasonLosses}-${seasonPushes}`);
+    const drafts = new Map<number, PredictionRecord>();
+    for (const record of predictionStore.values()) {
+      if (!record.isLocked && !record.lockedAt && Number.isSafeInteger(record.mlbGamePk)) {
+        const prior = drafts.get(record.mlbGamePk!);
+        if (!prior || (prior.draftUpdatedAt ?? 0) < (record.draftUpdatedAt ?? 0)) {
+          drafts.set(record.mlbGamePk!, record);
+        }
+      }
+    }
+    for (const [gamePk, record] of drafts) {
+      const result = await redisCommand([
+        "EVAL", SAVE_MLB_DRAFT_SCRIPT, "1", MLB_DRAFT_HASH,
+        String(gamePk), JSON.stringify(record), String(record.draftUpdatedAt ?? 0),
+      ], "Redis MLB draft EVAL");
+      if (result !== 0 && result !== 1) throw new Error("Redis MLB draft returned an invalid response");
+    }
+    console.log(`✅ Saved ${drafts.size} verified MLB drafts (legacy collection and season unchanged)`);
   }
   if (sport !== "MLB") {
     const nflPredictionsObj = Object.fromEntries(nflPredictionStore);
@@ -301,19 +499,96 @@ async function saveToRedisNow(sport: "MLB" | "NFL" | "BOTH") {
   }
 }
 
+function settlementSkip(gamePk: number | string, reason: string, details = ""): void {
+  console.log(`MLB settlement skipped: gamePk=${gamePk} reason=${reason}${details ? ` ${details}` : ""}`);
+}
+
+async function gradeOfficialMlb(record: PredictionRecord, totalRuns: number): Promise<void> {
+  const result = record.predictedPlay === "OVER"
+    ? totalRuns > record.total ? "WIN" : totalRuns < record.total ? "LOSS" : "PUSH"
+    : totalRuns < record.total ? "WIN" : totalRuns > record.total ? "LOSS" : "PUSH";
+  await queueRedisAction(async () => {
+    let persisted: PredictionRecord | null = null;
+    let season: any;
+    try {
+      const response = await redisCommand([
+        "EVAL", GRADE_MLB_SCRIPT, "2", MLB_OFFICIAL_HASH, "season",
+        String(record.mlbGamePk), result, String(totalRuns), new Date().toISOString(),
+      ], "Redis MLB grade");
+      if (!Array.isArray(response) || response.length !== 3) throw new Error("Redis MLB grade returned an invalid response");
+      persisted = validateOfficialMlb(JSON.parse(response[1]), record.mlbGamePk!);
+      season = JSON.parse(response[2]);
+    } catch (error) {
+      // A lost response is ambiguous. Read back the authoritative entry and
+      // counters before publishing a grade or retrying.
+      persisted = await readOfficialMlb(record.mlbGamePk!);
+      if (!persisted?.settled || persisted.result !== result || persisted.actualRuns !== totalRuns) throw error;
+      season = await redisGet("season");
+      if (season?.value && typeof season.value === "string") season = JSON.parse(season.value);
+    }
+    if (!persisted || !persisted.settled || persisted.result !== result
+      || !Number.isSafeInteger(season?.wins) || !Number.isSafeInteger(season?.losses)
+      || !Number.isSafeInteger(season?.pushes)) {
+      throw new Error(`MLB grade readback invalid for game ${record.mlbGamePk}`);
+    }
+    officialMlbStore.set(record.mlbGamePk!, persisted);
+    predictionStore.set(persisted.gameId, persisted);
+    seasonWins = season.wins;
+    seasonLosses = season.losses;
+    seasonPushes = season.pushes;
+    console.log(`✅ MLB Settled: ${persisted.awayTeam} @ ${persisted.homeTeam} — ${persisted.predictedPlay} ${persisted.total} — Actual: ${totalRuns} — ${result} — gamePk ${record.mlbGamePk}`);
+  });
+}
+
 async function settlePredictions() {
   const yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
   const dateStr = yesterday.toISOString().split("T")[0];
   try {
-    if (mlbSettlementSavePending) {
-      await saveToRedis("MLB");
-      mlbSettlementSavePending = false;
+    // Re-read the independent official records: another instance may have
+    // committed a lock or grade since this process last refreshed its cache.
+    await loadOfficialMlb();
+    for (const record of officialMlbStore.values()) {
+      if (record.date > dateStr) continue;
+      const gamePk = record.mlbGamePk!;
+      if (record.settled) { settlementSkip(gamePk, "already_settled"); continue; }
+      if (!record.isLocked) { settlementSkip(gamePk, "unlocked"); continue; }
+      if (record.predictedPlay === "NO EDGE") { settlementSkip(gamePk, "no_edge"); continue; }
+      if (!["OVER", "UNDER"].includes(record.predictedPlay) || !Number.isFinite(record.total)) {
+        settlementSkip(gamePk, "invalid_play"); continue;
+      }
+      try {
+        const res = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&gamePks=${gamePk}&hydrate=linescore`);
+        if (!res.ok) throw new Error(`MLB schedule HTTP ${res.status}`);
+        const data = await res.json() as any;
+        const game = (data?.dates || []).flatMap((day: any) => day.games || []).find((item: any) => item.gamePk === gamePk);
+        if (!game) { settlementSkip(gamePk, "schedule_missing"); continue; }
+        if (game.teams?.home?.team?.name !== record.homeTeam
+          || game.teams?.away?.team?.name !== record.awayTeam) {
+          settlementSkip(gamePk, "matchup_mismatch"); continue;
+        }
+        const status = String(game.status?.detailedState || "").toLowerCase();
+        if (/(postponed|cancelled|suspended)/.test(status)) {
+          settlementSkip(gamePk, "game_not_final", status); continue;
+        }
+        if (game.status?.abstractGameState !== "Final") {
+          settlementSkip(gamePk, "game_not_final", status); continue;
+        }
+        const homeRuns = game.teams?.home?.score;
+        const awayRuns = game.teams?.away?.score;
+        if (!Number.isFinite(homeRuns) || !Number.isFinite(awayRuns) || homeRuns + awayRuns === 0) {
+          settlementSkip(gamePk, "invalid_score"); continue;
+        }
+        await gradeOfficialMlb(record, homeRuns + awayRuns);
+      } catch (err: any) {
+        console.error(`MLB settlement failed: gamePk=${gamePk}: ${err.message}`);
+      }
     }
-    // After a restart, unfinished locked picks still in Redis are eligible for recovery.
+    // Legacy records are read without rewriting them. Never substitute one
+    // game of a doubleheader for another record lacking a verified gamePk.
     const dates = new Set([dateStr]);
     for (const record of predictionStore.values()) {
-      if (record.isLocked && !record.settled
+      if (!record.mlbGamePk && record.isLocked && !record.settled
         && (record.predictedPlay === "OVER" || record.predictedPlay === "UNDER")
         && /^\d{4}-\d{2}-\d{2}$/.test(record.date) && record.date <= dateStr) {
         dates.add(record.date);
@@ -323,49 +598,48 @@ async function settlePredictions() {
       try {
         console.log(`Settling MLB predictions for ${settlementDate}...`);
         const res = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${settlementDate}&hydrate=linescore`);
+        if (!res.ok) throw new Error(`MLB schedule HTTP ${res.status}`);
         const data = await res.json() as any;
         const games = data?.dates?.[0]?.games || [];
         for (const game of games) {
+          if (officialMlbStore.has(game.gamePk)) continue;
           const homeTeamName = game.teams?.home?.team?.name;
           const awayTeamName = game.teams?.away?.team?.name;
-          const match = findPredictionForMatch(
-            predictionStore,
-            settlementDate,
-            homeTeamName,
-            awayTeamName,
-            game.gameDate,
-          );
-          if (!match) continue;
+          const candidates = Array.from(predictionStore.entries()).filter(([, p]) =>
+            !p.mlbGamePk && p.date === settlementDate && p.homeTeam === homeTeamName && p.awayTeam === awayTeamName);
+          const sameMatchupGames = games.filter((g: any) =>
+            g.teams?.home?.team?.name === homeTeamName && g.teams?.away?.team?.name === awayTeamName);
+          if (!candidates.length) { settlementSkip(game.gamePk, "missing_record"); continue; }
+          if (candidates.length !== 1 || sameMatchupGames.length !== 1) {
+            settlementSkip(game.gamePk, "ambiguous_legacy_matchup"); continue;
+          }
+          const match = candidates[0];
           const [gameId, record] = match;
-          if (record.settled || !record.isLocked) continue;
+          if (record.settled) { settlementSkip(game.gamePk, "already_settled"); continue; }
+          if (!record.isLocked) { settlementSkip(game.gamePk, "unlocked"); continue; }
           const detailedState = game.status?.detailedState ?? '';
-          if (detailedState.toLowerCase().includes('postponed') || detailedState.toLowerCase().includes('cancelled') || detailedState.toLowerCase().includes('suspended')) continue;
-          if (game.status?.abstractGameState !== "Final") continue;
+          if (detailedState.toLowerCase().includes('postponed') || detailedState.toLowerCase().includes('cancelled') || detailedState.toLowerCase().includes('suspended')) { settlementSkip(game.gamePk, "game_not_final"); continue; }
+          if (game.status?.abstractGameState !== "Final") { settlementSkip(game.gamePk, "game_not_final"); continue; }
           const homeRuns = game.teams?.home?.score ?? 0;
           const awayRuns = game.teams?.away?.score ?? 0;
           const totalRuns = homeRuns + awayRuns;
-          if (totalRuns === 0) continue;
-          let result: "WIN" | "LOSS" | "PUSH" = "PUSH";
-          if (record.predictedPlay === "OVER") result = totalRuns > record.total ? "WIN" : totalRuns < record.total ? "LOSS" : "PUSH";
-          else if (record.predictedPlay === "UNDER") result = totalRuns < record.total ? "WIN" : totalRuns > record.total ? "LOSS" : "PUSH";
-          else { record.settled = true; predictionStore.set(gameId, record); continue; }
-          record.settled = true;
-          record.actualRuns = totalRuns;
-          record.result = result;
-          predictionStore.set(gameId, record);
-          mlbSettlementSavePending = true;
-          if (result === "WIN") seasonWins++;
-          else if (result === "LOSS") seasonLosses++;
-          else seasonPushes++;
-          console.log(`✅ MLB Settled: ${record.awayTeam} @ ${record.homeTeam} — ${record.predictedPlay} ${record.total} — Actual: ${totalRuns} — ${result}`);
+          if (totalRuns === 0) { settlementSkip(game.gamePk, "invalid_score"); continue; }
+          if (record.predictedPlay !== "OVER" && record.predictedPlay !== "UNDER") {
+            settlementSkip(game.gamePk, "invalid_play"); continue;
+          }
+          if (!Number.isSafeInteger(game.gamePk)) {
+            settlementSkip("unknown", "missing_game_pk"); continue;
+          }
+          // Migrate only an unambiguous, previously locked legacy record.
+          // Do not rewrite the oversized legacy collection or its season key.
+          const confirmed = await persistOfficialMlb({ ...record, mlbGamePk: game.gamePk });
+          officialMlbStore.set(game.gamePk, confirmed);
+          predictionStore.set(gameId, confirmed);
+          await gradeOfficialMlb(confirmed, totalRuns);
         }
       } catch (err: any) {
         console.error(`Error settling MLB predictions for ${settlementDate}:`, err.message);
       }
-    }
-    if (mlbSettlementSavePending) {
-      await saveToRedis("MLB");
-      mlbSettlementSavePending = false;
     }
   } catch (err: any) {
     console.error("Error settling MLB predictions:", err.message);
@@ -760,22 +1034,87 @@ async function fetchPitcherStats(playerId: number, playerName: string): Promise<
   }
 }
 
-async function fetchProbablePitchers(date: string): Promise<Map<string, { home: any; away: any }>> {
-  const map = new Map<string, { home: any; away: any }>();
+interface ScheduledMlbGame {
+  gamePk: number;
+  gameDate: string;
+  homeTeam: string;
+  awayTeam: string;
+  homePitcher?: any;
+  awayPitcher?: any;
+}
+
+async function fetchMlbScheduleForDrafts(date: string): Promise<ScheduledMlbGame[] | null> {
+  const gamesForDate: ScheduledMlbGame[] = [];
   try {
     const res = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${date}&hydrate=probablePitcher`);
+    if (!res.ok) throw new Error(`MLB schedule HTTP ${res.status}`);
     const data = await res.json() as any;
+    if (!Array.isArray(data?.dates)) throw new Error("MLB schedule response missing dates");
     const games = data?.dates?.[0]?.games || [];
     for (const game of games) {
-      const homeTeam = game.teams?.home?.team?.name;
-      const homePitcher = game.teams?.home?.probablePitcher;
-      const awayPitcher = game.teams?.away?.probablePitcher;
-      if (homeTeam) map.set(homeTeam, { home: homePitcher, away: awayPitcher });
+      if (Number.isSafeInteger(game.gamePk) && game.teams?.home?.team?.name && game.teams?.away?.team?.name) {
+        gamesForDate.push({
+          gamePk: game.gamePk, gameDate: game.gameDate,
+          homeTeam: game.teams.home.team.name, awayTeam: game.teams.away.team.name,
+          homePitcher: game.teams.home.probablePitcher, awayPitcher: game.teams.away.probablePitcher,
+        });
+      }
     }
   } catch (err: any) {
-    console.error("Failed to fetch probable pitchers:", err.message);
+    console.error("Failed to fetch MLB schedule for game identity:", err.message);
+    return null;
   }
-  return map;
+  return gamesForDate;
+}
+
+function bindOddsToMlbGames(oddsGames: any[], schedule: ScheduledMlbGame[]): Map<string, ScheduledMlbGame> {
+  const candidates = new Map<string, ScheduledMlbGame>();
+  for (const odds of oddsGames) {
+    const time = Date.parse(odds.commence_time);
+    if (!Number.isFinite(time)) continue;
+    const matchup = schedule.filter(game =>
+      game.homeTeam === odds.home_team && game.awayTeam === odds.away_team
+      && Number.isFinite(Date.parse(game.gameDate)));
+    const ranked = matchup.sort((a, b) =>
+      Math.abs(Date.parse(a.gameDate) - time) - Math.abs(Date.parse(b.gameDate) - time)
+    );
+    if (!ranked.length) continue;
+    // A matchup is not a game ID. A doubleheader needs a complete, one-to-one
+    // slate with starts agreeing almost exactly; shifted/partial feeds fail shut.
+    const sameOdds = oddsGames.filter(game =>
+      game.home_team === odds.home_team && game.away_team === odds.away_team);
+    if (matchup.length > 1 && sameOdds.length !== matchup.length) continue;
+    const tolerance = matchup.length > 1 ? 60 * 1000 : 10 * 60 * 1000;
+    if (Math.abs(Date.parse(ranked[0].gameDate) - time) > tolerance) continue;
+    if (ranked[1] && Math.abs(Date.parse(ranked[1].gameDate) - time)
+      - Math.abs(Date.parse(ranked[0].gameDate) - time) < 2 * 60 * 1000) continue;
+    candidates.set(odds.id, ranked[0]);
+  }
+  const usages = new Map<number, number>();
+  for (const game of candidates.values()) usages.set(game.gamePk, (usages.get(game.gamePk) ?? 0) + 1);
+  for (const [oddsId, game] of candidates) if (usages.get(game.gamePk)! > 1) candidates.delete(oddsId);
+  return candidates;
+}
+
+function officialForOddsGame(oddsGameId: string, gamePk?: number): PredictionRecord | undefined {
+  // An odds ID alone never proves this is the same MLB game.
+  return gamePk ? officialMlbStore.get(gamePk) : undefined;
+}
+
+function verifiedGamePkForDraft(
+  bound: ScheduledMlbGame | undefined,
+  previous: PredictionRecord | undefined,
+  scheduleUnavailable: boolean,
+  homeTeam: string,
+  awayTeam: string,
+  commenceTime: string,
+): number | undefined {
+  if (bound) return bound.gamePk;
+  // A schedule API outage is not evidence that a verified identity changed.
+  // A successful but ambiguous schedule is different: fail closed.
+  return scheduleUnavailable && previous?.homeTeam === homeTeam
+    && previous?.awayTeam === awayTeam && previous?.commenceTime === commenceTime
+    ? previous.mlbGamePk : undefined;
 }
 
 function calculatePitcherScore(pitcher: PitcherStats | null): number {
@@ -1005,7 +1344,39 @@ const WEATHER_API_KEY = process.env.WEATHER_API_KEY;
 
 app.get("/", (req, res) => { res.send("API is running 🚀"); });
 
-app.get("/results", (req, res) => {
+async function refreshMlbResults(): Promise<void> {
+  // Compare the count before/after the official scan so a grade committed in
+  // between cannot produce a mixed snapshot in /results.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const before = await redisGet("season");
+    await loadOfficialMlb();
+    const after = await redisGet("season");
+    if (JSON.stringify(before) !== JSON.stringify(after)) continue;
+    let season = after;
+    if (season?.value && typeof season.value === "string") season = JSON.parse(season.value);
+    if (season === null) {
+      if (Array.from(officialMlbStore.values()).some(record => record.settled)) {
+        throw new Error("MLB season missing for settled games");
+      }
+      seasonWins = seasonLosses = seasonPushes = 0;
+      return;
+    }
+    if (!season || !Number.isSafeInteger(season.wins) || season.wins < 0
+      || !Number.isSafeInteger(season.losses) || season.losses < 0
+      || (season.pushes !== undefined && (!Number.isSafeInteger(season.pushes) || season.pushes < 0))) {
+      throw new Error("Redis season record is invalid");
+    }
+    seasonWins = season.wins;
+    seasonLosses = season.losses;
+    seasonPushes = season.pushes ?? 0;
+    return;
+  }
+  throw new Error("MLB season changed while reading results");
+}
+
+app.get("/results", async (req, res) => {
+  try {
+    await refreshMlbResults();
   const yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
   const yesterdayStr = yesterday.toISOString().split("T")[0];
@@ -1039,6 +1410,9 @@ app.get("/results", (req, res) => {
       high_confidence: { wins: highConfWins, losses: highConfLosses, pushes: highConfPushes, total: highConfTotal, pct: highConfTotal > 0 ? Math.round((highConfWins / highConfTotal) * 100) : null },
     },
   });
+  } catch (err: any) {
+    res.status(503).json({ error: "Cannot verify MLB results", details: err.message });
+  }
 });
 
 app.get("/nfl-results", (req, res) => {
@@ -1477,7 +1851,8 @@ app.get("/venue-stats", async (req, res) => {
 
 async function fetchGames() {
   const { start, end, dateStr: today } = getTodayET();
-  const probablePitchers = await fetchProbablePitchers(today);
+  await loadOfficialMlb();
+  const schedule = await fetchMlbScheduleForDrafts(today);
   const oddsRes = await fetch(`https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=totals,h2h&oddsFormat=american`);
   if (!oddsRes.ok) throw new Error(`Odds API error: ${oddsRes.status}`);
   const oddsData = await oddsRes.json() as any[];
@@ -1486,6 +1861,7 @@ async function fetchGames() {
     return gameTime >= start && gameTime <= end;
   });
   console.log(`Found ${todayGames.length} games for today (${today} ET)`);
+  const boundGames = bindOddsToMlbGames(todayGames, schedule ?? []);
   let predictionsChanged = false;
   const results = await Promise.all(todayGames.map(async (game: any) => {
     const homeTeam = game.home_team;
@@ -1503,7 +1879,12 @@ async function fetchGames() {
     const total = (rawTotal !== null && rawTotal >= 5.5 && rawTotal <= 13.5) ? rawTotal : null;
     const homeML = h2hMarket?.outcomes?.find((o: any) => o.name === homeTeam)?.price ?? null;
     const awayML = h2hMarket?.outcomes?.find((o: any) => o.name === awayTeam)?.price ?? null;
-    const pitchers = probablePitchers.get(homeTeam);
+    const mlbGame = boundGames.get(game.id);
+    const previous = predictionStore.get(game.id);
+    const verifiedGamePk = verifiedGamePkForDraft(
+      mlbGame, previous, schedule === null, homeTeam, awayTeam, commenceTime,
+    );
+    const pitchers = mlbGame ? { home: mlbGame.homePitcher, away: mlbGame.awayPitcher } : undefined;
     let homePitcher: PitcherStats | null = null;
     let awayPitcher: PitcherStats | null = null;
     let homePitcherScore = 0;
@@ -1541,8 +1922,9 @@ async function fetchGames() {
               total, isFixedDome, isRetractable, homePitcherScore, awayPitcherScore,
               parkFactor, homeOffenseScore, awayOffenseScore, homeBullpenScore, awayBullpenScore,
             });
-            const changed = upsertPregameDraft(predictionStore, {
+            const changed = Boolean(verifiedGamePk && officialMlbStore.has(verifiedGamePk)) ? false : upsertPregameDraft(predictionStore, {
               gameId: game.id,
+              mlbGamePk: verifiedGamePk,
               date: today,
               homeTeam,
               awayTeam,
@@ -1560,17 +1942,25 @@ async function fetchGames() {
             if (changed) {
               predictionsChanged = true;
               console.log(`📝 MLB pregame draft updated: ${awayTeam} @ ${homeTeam} — ${edge.play} ${total} — ${edge.confidence}`);
+              if (!verifiedGamePk) console.error(`MLB game identity unresolved: oddsGameId=${game.id} ${awayTeam} @ ${homeTeam}; official lock disabled`);
+              if (mlbGame && !officialMlbStore.has(mlbGame.gamePk)) {
+                for (const [oldId, oldDraft] of predictionStore) {
+                  if (oldId !== game.id && oldDraft.mlbGamePk === mlbGame.gamePk
+                    && !oldDraft.isLocked && !oldDraft.lockedAt) predictionStore.delete(oldId);
+                }
+              }
             }
           }
         }
       } catch (e) {}
     }
-    const official = predictionStore.get(game.id);
+    const official = officialForOddsGame(game.id, verifiedGamePk);
     const isLocked = Boolean(official?.isLocked && official.lockedAt);
     const responseEdge = isLocked ? official?.edge : edge;
     const responseTotal = isLocked ? official?.total : total;
     return {
-      id: game.id, home_team: homeTeam, away_team: awayTeam, commence_time: commenceTime,
+      id: game.id, mlb_game_pk: verifiedGamePk ?? null,
+      home_team: homeTeam, away_team: awayTeam, commence_time: commenceTime,
       bookmaker: isLocked ? official?.bookmaker : (bookmaker?.title ?? "Unknown"),
       total: responseTotal,
       home_ml: isLocked ? official?.homeMoneyline : homeML,
@@ -1602,10 +1992,30 @@ async function fetchGames() {
   return results;
 }
 
+function reconcileCachedMlbGames(games: any[]): any[] {
+  return games.map(game => {
+    const official = officialForOddsGame(game.id, game.mlb_game_pk);
+    if (!official?.isLocked || !official.lockedAt) return game;
+    return {
+      ...game,
+      total: official.total, edge: official.edge, bookmaker: official.bookmaker,
+      home_ml: official.homeMoneyline, away_ml: official.awayMoneyline,
+      is_locked: true, locked_at: official.lockedAt,
+      official_pick: {
+        play: official.predictedPlay, confidence: official.confidence,
+        line: official.total, model_projection: official.modelProjection,
+        edge: official.edge, locked_at: official.lockedAt,
+      },
+    };
+  });
+}
+
 app.get("/games", async (req, res) => {
   try {
     const now = Date.now();
     if (cachedGames && (now - lastCacheTime) < CACHE_DURATION_MS) {
+      await loadOfficialMlb();
+      cachedGames = reconcileCachedMlbGames(cachedGames);
       res.setHeader("X-Cache", "HIT");
       return res.json(cachedGames);
     }
@@ -1615,7 +2025,15 @@ app.get("/games", async (req, res) => {
     res.setHeader("X-Cache", "MISS");
     res.json(games);
   } catch (err: any) {
-    if (cachedGames) return res.json(cachedGames);
+    if (cachedGames) {
+      try {
+        await loadOfficialMlb();
+        cachedGames = reconcileCachedMlbGames(cachedGames);
+        return res.json(cachedGames);
+      } catch {
+        return res.status(503).json({ error: "Cannot verify MLB official locks", details: err.message });
+      }
+    }
     res.status(500).json({ error: "Failed to fetch games data", details: err.message });
   }
 });
@@ -1655,7 +2073,9 @@ async function startup() {
   await lockDuePredictions();
   await refreshCache();
   setInterval(refreshCache, 30 * 60 * 1000);
-  setInterval(lockDuePredictions, 15 * 1000);
+  setInterval(() => {
+    lockDuePredictions().catch(err => console.error("Lock pass failed:", err.message));
+  }, 15 * 1000);
   scheduleSettlement();
 }
 
@@ -1664,13 +2084,8 @@ startup().catch(err => {
   process.exit(1);
 });
 
-app.get("/force-save-season", async (req, res) => {
-  try {
-    await saveToRedis();
-    res.json({ success: true, season: { wins: seasonWins, losses: seasonLosses, pushes: seasonPushes }, nfl: { wins: nflSeasonWins, losses: nflSeasonLosses, pushes: nflSeasonPushes } });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+app.get("/force-save-season", (req, res) => {
+  res.status(410).json({ error: "Season writes are only permitted through idempotent settlement" });
 });
 
 export default app;
