@@ -208,7 +208,23 @@ async function lockDuePredictions(): Promise<void> {
 async function loadFromRedis() {
   seasonReady = false;
   console.log("Loading data from Redis...");
-  const predictions = await redisGet("predictions");
+  const storedPredictions = await redisGet("predictions");
+  let predictions = storedPredictions;
+  if (storedPredictions !== null && typeof storedPredictions === "object" && !Array.isArray(storedPredictions)
+    && Object.keys(storedPredictions).length === 1
+    && Object.prototype.hasOwnProperty.call(storedPredictions, "value")) {
+    if (typeof storedPredictions.value !== "string") {
+      throw new Error("Redis predictions record is invalid; refusing to replace it");
+    }
+    try {
+      predictions = JSON.parse(storedPredictions.value);
+    } catch {
+      throw new Error("Redis predictions record is invalid; refusing to replace it");
+    }
+  }
+  if (storedPredictions !== null && (predictions === null || typeof predictions !== "object" || Array.isArray(predictions))) {
+    throw new Error("Redis predictions record is invalid; refusing to replace it");
+  }
   const storedSeason = await redisGet("season");
   let season = storedSeason;
   const nflPredictions = await redisGet("nfl_predictions");
