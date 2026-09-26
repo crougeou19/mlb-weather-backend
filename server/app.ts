@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import { Buffer } from "node:buffer";
 
 const app = express();
 app.use(cors());
@@ -24,6 +25,23 @@ async function redisGet(key: string): Promise<any> {
   if (data.result === null) return null;
   const value = JSON.parse(data.result);
   if (value === null) throw new Error(`Redis GET ${key} contains a stored null value`);
+  if (key === "predictions") {
+    let current = value;
+    let depth = 0;
+    while (current && typeof current === "object" && !Array.isArray(current)
+      && Object.keys(current).length === 1 && typeof current.value === "string" && depth < 32) {
+      try {
+        current = JSON.parse(current.value);
+      } catch {
+        break;
+      }
+      depth++;
+    }
+    console.log("Redis predictions read metadata:", {
+      storedBytes: Buffer.byteLength(data.result), wrapperDepth: depth,
+      innerType: typeof current, innerEntryCount: current && typeof current === "object" && !Array.isArray(current) ? Object.keys(current).length : null,
+    });
+  }
   return value;
 }
 
@@ -43,18 +61,20 @@ async function redisSet(key: string, value: any): Promise<void> {
 
 async function redisSaveMlb(predictions: Record<string, PredictionRecord>): Promise<void> {
   // One Redis command prevents a settled prediction from being durable without its season count.
+  const body = JSON.stringify([
+    "MSET",
+    "predictions", JSON.stringify(predictions),
+    "season", JSON.stringify({ wins: seasonWins, losses: seasonLosses, pushes: seasonPushes }),
+  ]);
   const res = await fetch(`${REDIS_URL}`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${REDIS_TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify([
-      "MSET",
-      "predictions", JSON.stringify(predictions),
-      "season", JSON.stringify({ wins: seasonWins, losses: seasonLosses, pushes: seasonPushes }),
-    ]),
+    body,
   });
+  if (res.status === 413) console.error("Redis MLB MSET request rejected:", { requestBytes: Buffer.byteLength(body) });
   if (!res.ok) throw new Error(`Redis MLB MSET failed: HTTP ${res.status}`);
   const data = await res.json() as any;
   if (data?.result !== "OK") throw new Error("Redis MLB MSET returned an invalid response");
